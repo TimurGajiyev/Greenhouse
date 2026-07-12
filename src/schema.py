@@ -65,6 +65,16 @@ class PVConfig(BaseModel):
     # результатов посчитает число панелей: ceil(размер / unit_kw).
     unit_kw: float | None = Field(default=None, gt=0)
 
+    # Геометрия установки панелей (новое в шаге 4, оба поля необязательны).
+    # tilt_deg — наклон панели от горизонтали в градусах: 0 = лежит
+    # плашмя, 90 = стоит вертикально.
+    # azimuth_deg — куда "смотрит" панель по сторонам света: 0 = север,
+    # 90 = восток, 180 = юг, 270 = запад.
+    # None = solar.py возьмёт дефолты в стиле REopt/PVWatts
+    # (крыша: наклон 20°, азимут в сторону экватора).
+    tilt_deg: float | None = Field(default=None, ge=0, le=90)
+    azimuth_deg: float | None = Field(default=None, ge=0, lt=360)
+
     # Срок службы, лет — вход для CRF (capital recovery factor,
     # формула превращения разовой покупки в равные годовые платежи).
     lifetime_years: int = Field(gt=0)
