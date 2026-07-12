@@ -1,0 +1,54 @@
+{
+  "name": "Yemen factory - vendor sizes",
+  "site": {
+    "name": "Sana'a Factory",
+    "latitude": 15.2811,
+    "longitude": 44.0811,
+    "timezone": "Asia/Aden"
+  },
+  "pv": {
+    "capex_usd_per_kw": 398,
+    "om_usd_per_kw_year": 8,
+    "min_kw": 1500,
+    "max_kw": 1500,
+    "unit_kw": 0.58,
+    "lifetime_years": 25
+  },
+  "battery": {
+    "capex_usd_per_kwh": 196,
+    "capex_usd_per_kw": 0,
+    "om_usd_per_kwh_year": 2,
+    "rte_fraction": 0.85,
+    "soc_min_fraction": 0.2,
+    "min_kwh": 3132,
+    "max_kwh": 3132,
+    "min_kw": 1500,
+    "max_kw": 1500,
+    "unit_kwh": 261,
+    "unit_kw": 125,
+    "lifetime_years": 10
+  },
+  "diesel": {
+    "capex_usd_per_kw": 307,
+    "om_usd_per_kw_year": 15,
+    "fuel_cost_usd_per_kwh": 0.26,
+    "min_kw": 1000,
+    "max_kw": 1000,
+    "unit_kw": 1000,
+    "lifetime_years": 20
+  },
+  "load": {
+    "day_kw": 700,
+    "night_kw": 50,
+    "work_start_hour": 8,
+    "work_end_hour": 18
+  },
+  "financial": {
+    "discount_rate_fraction": 0.08,
+    "project_years": 10,
+    "currency": "USD"
+  },
+  "reliability": {
+    "mode": "hard"
+  }
+}
