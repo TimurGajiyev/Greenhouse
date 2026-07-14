@@ -40,6 +40,11 @@ class SiteConfig(BaseModel):
     # профиль солнца обязаны жить в одном местном времени.
     timezone: str
 
+    # Площадь под панели, м² (опционально, новое в шаге 8): потолок
+    # для сайзера — pv_kwp * m2_per_kwp <= roof_area_m2.
+    # None = ограничения площади нет.
+    roof_area_m2: float | None = Field(default=None, gt=0)
+
 
 class PVConfig(BaseModel):
     """Солнечные панели (PV — photovoltaics)."""
@@ -74,6 +79,10 @@ class PVConfig(BaseModel):
     # (крыша: наклон 20°, азимут в сторону экватора).
     tilt_deg: float | None = Field(default=None, ge=0, le=90)
     azimuth_deg: float | None = Field(default=None, ge=0, lt=360)
+
+    # Сколько м² крыши занимает 1 kWp (опционально, шаг 8). None =
+    # сайзер возьмёт дефолт с пометкой ASSUMPTION (см. optimize.py).
+    m2_per_kwp: float | None = Field(default=None, gt=0)
 
     # Срок службы, лет — вход для CRF (capital recovery factor,
     # формула превращения разовой покупки в равные годовые платежи).
@@ -114,6 +123,14 @@ class BatteryConfig(BaseModel):
     # разряжаем, чтобы беречь ресурс ячеек.
     soc_min_fraction: float = Field(ge=0, lt=1)
 
+    # Саморазряд: какая ДОЛЯ запаса утекает за один час простоя
+    # (паттерн storage_loss из Calliope: множитель (1-loss)^Δt в
+    # SOC-динамике). None = 0 (не моделируем). Для LFP-химии типично
+    # ~1-2% в МЕСЯЦ, то есть ~2e-5 в час — уточнить по datasheet.
+    self_discharge_fraction_per_hour: float | None = Field(
+        default=None, ge=0, lt=1
+    )
+
     # Коридоры двух размеров.
     min_kwh: float = Field(ge=0)
     max_kwh: float = Field(gt=0)
@@ -144,9 +161,18 @@ class DieselConfig(BaseModel):
     capex_usd_per_kw: float = Field(gt=0)
     om_usd_per_kw_year: float = Field(ge=0)
 
-    # Стоимость 1 кВт*ч из дизеля. Упрощение v0: физика — литры на
-    # кВт*ч, умноженные на цену литра; PDF даёт готовые 0.26 $/кВт*ч.
+    # Стоимость 1 кВт*ч из дизеля. Упрощение v1: плоский тариф; PDF
+    # даёт готовые 0.26 $/кВт*ч. Реальная топливная кривая генсета
+    # (расход холостого хода + наклон, как fuel_intercept/fuel_slope
+    # в REopt и HOMER) — сознательно отложена: она делает цену kWh
+    # зависящей от загрузки и требует MILP. См. отчёт шага 6.
     fuel_cost_usd_per_kwh: float = Field(gt=0)
+
+    # Удельный расход топлива, литров на кВт*ч (опционально, новое в
+    # шаге 6). Если задан — KPI-слой посчитает ЛИТРЫ за год (для
+    # планирования завоза топлива, резерв площадки 20 000 л). Деньги
+    # v1 всё равно считает через fuel_cost_usd_per_kwh.
+    fuel_liters_per_kwh: float | None = Field(default=None, gt=0)
 
     min_kw: float = Field(ge=0)
     max_kw: float = Field(gt=0)
@@ -229,12 +255,39 @@ class FinancialConfig(BaseModel):
 
 
 class ReliabilityConfig(BaseModel):
-    """Требование к надёжности электроснабжения."""
+    """Требование к надёжности электроснабжения (расширено в шаге 8).
+
+    Три политики — как в REopt (min_load_met_annual_fraction,
+    dvUnservedLoad):
+      hard — недопоставка запрещена вовсе (Σ shortfall == 0);
+      lpsp — недопоставка не выше доли lpsp_max_fraction от спроса
+             (LPSP <= x%): "99% надёжности достаточно, зато дешевле";
+      voll — жёсткого требования нет, каждый недопоставленный kWh
+             штрафуется ценой voll_usd_per_kwh в целевой функции —
+             солвер сам решает, что дешевле: покрыть или потерять.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    # Пока единственный режим: покрыть 100% нагрузки.
-    mode: Literal["hard"]
+    mode: Literal["hard", "lpsp", "voll"]
+
+    # Параметры режимов; каждый обязателен ровно для своего режима.
+    lpsp_max_fraction: float | None = Field(default=None, gt=0, lt=1)
+    voll_usd_per_kwh: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_mode_params(self):
+        if self.mode == "lpsp" and self.lpsp_max_fraction is None:
+            raise ValueError("Reliability: режим lpsp требует lpsp_max_fraction")
+        if self.mode == "voll" and self.voll_usd_per_kwh is None:
+            raise ValueError("Reliability: режим voll требует voll_usd_per_kwh")
+        if self.mode == "hard" and (
+            self.lpsp_max_fraction is not None or self.voll_usd_per_kwh is not None
+        ):
+            raise ValueError(
+                "Reliability: режим hard не принимает lpsp_max_fraction/voll_usd_per_kwh"
+            )
+        return self
 
 
 class Scenario(BaseModel):
