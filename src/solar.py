@@ -119,9 +119,22 @@ def build_solar_profile(
     # 2) Геометрия панели: из сценария или дефолты в стиле REopt.
     tilt, azimuth = _resolve_geometry(scenario)
 
+    # 2б) Параметры модуля/инвертора: из сценария (datasheet вендора),
+    #     иначе — константы-дефолты этого модуля (v1.1, кейсы OKC/NIST).
+    pv = scenario.pv
+    gamma = (pv.gamma_pdc_per_c if pv is not None and pv.gamma_pdc_per_c
+             is not None else GAMMA_PDC_PER_C)
+    inv_eff = (pv.inverter_eff_fraction if pv is not None and
+               pv.inverter_eff_fraction is not None else INVERTER_EFFICIENCY)
+    dc_ac = (pv.dc_ac_ratio if pv is not None and pv.dc_ac_ratio
+             is not None else DC_AC_RATIO)
+    mount = (pv.mount_type if pv is not None and pv.mount_type
+             is not None else "close_mount")
+
     # 3) Физика PVWatts: погода -> kW на 1 kWp (индекс пока UTC).
     ac_per_kwp = _pvwatts_ac_per_kwp(
-        weather, site.latitude, site.longitude, tilt, azimuth
+        weather, site.latitude, site.longitude, tilt, azimuth,
+        gamma=gamma, inv_eff=inv_eff, dc_ac=dc_ac, mount=mount,
     )
 
     # 4) Переставляем ряд на местную ось времени площадки — чтобы он
@@ -252,13 +265,25 @@ def _pvwatts_ac_per_kwp(
     lon: float,
     tilt: float,
     azimuth: float,
+    gamma: float | None = None,
+    inv_eff: float | None = None,
+    dc_ac: float | None = None,
+    mount: str = "close_mount",
 ) -> pd.Series:
     """Цепочка PVWatts: погода -> kW переменного тока на 1 kWp.
 
     Шаги (каждый — стандартная функция pvlib):
       положение солнца -> облучённость плоскости панели (POA) ->
       температура ячейки -> DC-мощность -> потери -> инвертор.
+
+    gamma / inv_eff / dc_ac / mount — переопределения из сценария
+    (None = константы-дефолты модуля; battle-скрипты, правящие
+    константы напрямую, продолжают работать).
     """
+    gamma = gamma if gamma is not None else GAMMA_PDC_PER_C
+    inv_eff = inv_eff if inv_eff is not None else INVERTER_EFFICIENCY
+    dc_ac = dc_ac if dc_ac is not None else DC_AC_RATIO
+
     times = weather.index
 
     # 1) Положение солнца для каждого часа: зенитный угол (zenith —
@@ -288,13 +313,13 @@ def _pvwatts_ac_per_kwp(
     poa_global = poa["poa_global"].fillna(0.0)
 
     # 3) Температура ячейки: чем жарче ячейка, тем ниже мощность.
-    #    Модель SAPM с параметрами close_mount_glass_glass —
-    #    панели вплотную к крыше охлаждаются хуже, чем на раме.
-    # ASSUMPTION: тип монтажа close_mount — по фото вендора не ясно;
-    #    вариант open_rack дал бы на ~1-2% больше выработки.
-    temp_params = pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"][
-        "close_mount_glass_glass"
-    ]
+    #    Модель SAPM; параметры зависят от типа монтажа: close_mount —
+    #    вплотную к крыше (греется сильнее), open_rack — на раме или
+    #    земле (охлаждается лучше, +1-2% выработки). Кейс NIST показал,
+    #    что для наземных полей это различие значимо.
+    sapm_key = ("open_rack_glass_glass" if mount == "open_rack"
+                else "close_mount_glass_glass")
+    temp_params = pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"][sapm_key]
     cell_temp = pvlib.temperature.sapm_cell(
         poa_global, weather["temp_air"], weather["wind_speed"], **temp_params
     )
@@ -303,7 +328,7 @@ def _pvwatts_ac_per_kwp(
     #    P = P_ном * (POA/1000) * (1 + gamma * (T_ячейки - 25)).
     #    pdc0=1.0 значит "система номиналом 1 кВт" — получаем удельный ряд.
     pdc = pvlib.pvsystem.pvwatts_dc(
-        poa_global, cell_temp, pdc0=1.0, gamma_pdc=GAMMA_PDC_PER_C
+        poa_global, cell_temp, pdc0=1.0, gamma_pdc=gamma
     )
 
     # 5) Системные потери одним множителем: pvwatts_losses комбинирует
@@ -315,7 +340,7 @@ def _pvwatts_ac_per_kwp(
     #    рассчитан на 1/DC_AC_RATIO от мощности панелей, всё сверх его
     #    номинала теряется. pdc0 здесь — DC-предел ИНВЕРТОРА.
     ac = pvlib.inverter.pvwatts(
-        pdc, pdc0=1.0 / DC_AC_RATIO, eta_inv_nom=INVERTER_EFFICIENCY
+        pdc, pdc0=1.0 / dc_ac, eta_inv_nom=inv_eff
     )
 
     # Ночью инвертор "выключен" — формула даёт NaN; и защищаемся от

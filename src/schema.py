@@ -84,6 +84,18 @@ class PVConfig(BaseModel):
     # сайзер возьмёт дефолт с пометкой ASSUMPTION (см. optimize.py).
     m2_per_kwp: float | None = Field(default=None, gt=0)
 
+    # Параметры PV-модуля и инвертора (v1.1: подняты из констант
+    # solar.py в контракт по итогам верификационных кейсов OKC и NIST —
+    # у вендоров эти числа в datasheet). None = дефолты solar.py.
+    inverter_eff_fraction: float | None = Field(default=None, gt=0, le=1)
+    dc_ac_ratio: float | None = Field(default=None, gt=0)
+    # Температурный коэффициент мощности, доля/°C (отрицательный:
+    # -0.0047 = -0.47%/°C — стандартный кристаллический кремний).
+    gamma_pdc_per_c: float | None = Field(default=None, ge=-0.02, lt=0)
+    # Тип монтажа для температурной модели: close_mount — вплотную к
+    # крыше (греется сильнее), open_rack — на раме/земле (охлаждается).
+    mount_type: Literal["close_mount", "open_rack"] | None = None
+
     # Срок службы, лет — вход для CRF (capital recovery factor,
     # формула превращения разовой покупки в равные годовые платежи).
     lifetime_years: int = Field(gt=0)

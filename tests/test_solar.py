@@ -91,3 +91,31 @@ def test_geometry_fields_accepted_by_schema():
     annual_flat = build_solar_profile(flat, weather_csv=WEATHER_CSV).sum()
     annual_tilted = build_profile().sum()
     assert annual_flat != annual_tilted
+
+
+def test_module_params_from_scenario():
+    """Параметры модуля из сценария (v1.1, кейсы OKC/NIST) реально
+    меняют результат: хуже КПД инвертора / больший саморазогрев
+    close_mount дают меньше энергии, open_rack — больше."""
+    with open(SCENARIO_PATH, encoding="utf-8") as f:
+        base = json.load(f)
+
+    base_annual = build_profile().sum()
+
+    # Худший инвертор (0.90 против дефолта 0.96) -> меньше выработки.
+    d = json.loads(json.dumps(base))
+    d["pv"]["inverter_eff_fraction"] = 0.90
+    worse_inv = build_solar_profile(
+        Scenario.model_validate(d), weather_csv=WEATHER_CSV).sum()
+    assert worse_inv < base_annual
+
+    # open_rack охлаждается лучше close_mount -> выработка выше.
+    d_close = json.loads(json.dumps(base))
+    d_close["pv"]["mount_type"] = "close_mount"
+    d_open = json.loads(json.dumps(base))
+    d_open["pv"]["mount_type"] = "open_rack"
+    close = build_solar_profile(
+        Scenario.model_validate(d_close), weather_csv=WEATHER_CSV).sum()
+    openr = build_solar_profile(
+        Scenario.model_validate(d_open), weather_csv=WEATHER_CSV).sum()
+    assert openr > close

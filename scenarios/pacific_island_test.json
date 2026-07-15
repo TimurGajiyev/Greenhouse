@@ -1,0 +1,48 @@
+{
+  "name": "Pacific Island Battle Test (Tonga, off-grid clinic) [reference]",
+  "site": {
+    "name": "Tongatapu clinic (prototype: NREL CRB Outpatient/Miami)",
+    "latitude": -21.1789,
+    "longitude": -175.1982,
+    "timezone": "Pacific/Tongatapu"
+  },
+  "pv": {
+    "capex_usd_per_kw": 1300,
+    "om_usd_per_kw_year": 20,
+    "min_kw": 150.0,
+    "max_kw": 150.0,
+    "lifetime_years": 25
+  },
+  "battery": {
+    "capex_usd_per_kwh": 600,
+    "capex_usd_per_kw": 0,
+    "om_usd_per_kwh_year": 10,
+    "rte_fraction": 0.9,
+    "soc_min_fraction": 0.2,
+    "min_kwh": 400.0,
+    "max_kwh": 400.0,
+    "min_kw": 200.0,
+    "max_kw": 200.0,
+    "lifetime_years": 10
+  },
+  "diesel": {
+    "capex_usd_per_kw": 500,
+    "om_usd_per_kw_year": 25,
+    "fuel_cost_usd_per_kwh": 0.3645,
+    "fuel_liters_per_kwh": 0.27,
+    "min_kw": 100.0,
+    "max_kw": 100.0,
+    "lifetime_years": 15
+  },
+  "load": {
+    "profile_csv": "scenarios\\pacific_island_load.csv"
+  },
+  "financial": {
+    "discount_rate_fraction": 0.08,
+    "project_years": 20,
+    "currency": "USD"
+  },
+  "reliability": {
+    "mode": "hard"
+  }
+}
