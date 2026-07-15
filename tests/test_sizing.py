@@ -144,6 +144,26 @@ def test_hard_infeasible_raises(tmp_path):
 
 # ---------- площадь и штуки ----------
 
+def test_operating_reserve_costs_more_and_holds(tmp_path):
+    """Оперативный резерв (v1.2, принципиальная замена firm-capacity):
+    требование держать горячий запас мощности каждый час удорожает
+    оптимум (LP больше не может срезать железо в притык) — при этом
+    недопоставки по-прежнему нет. Йемен, открытые коридоры."""
+    data = load_dict(SCENARIO_SIZING)
+    base = optimize_sizing(
+        Scenario.model_validate(json.loads(json.dumps(data))),
+        weather_csv=WEATHER_CSV, write_outputs=False)
+
+    data["reliability"] = {"mode": "hard",
+                           "operating_reserve_load_fraction": 0.3}
+    res = optimize_sizing(Scenario.model_validate(data),
+                          weather_csv=WEATHER_CSV, write_outputs=False)
+
+    assert (res.sim.manifest["objective_value"]
+            > base.sim.manifest["objective_value"])
+    assert res.sim.manifest["totals_kwh"]["shortfall"] == pytest.approx(0)
+
+
 def test_roof_area_caps_pv():
     """Йемен с открытыми коридорами: PV упирается в крышу —
     8500 м² / 5 м² на kWp = 1700 kWp (ограничение активно, потому

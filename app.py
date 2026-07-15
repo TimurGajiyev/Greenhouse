@@ -32,7 +32,7 @@ from src.profiles import build_load_profile, timestep_hours
 from src.solar import build_solar_profile
 from src.simulate import run_simulation
 from src.economics import capital_recovery_factor
-from src.optimize import optimize_sizing
+from src.optimize import optimize_sizing, optimize_sizing_milp
 from src.sweep import run_sensitivity
 # app_i18n перезагружаем явно: Streamlit hot-reload обновляет только
 # главный скрипт, а импортированные модули берёт из кэша sys.modules —
@@ -84,12 +84,20 @@ def _apply_load(data: dict, load_csv_text: str | None) -> dict:
 
 @st.cache_data(show_spinner="LP...")
 def run_sizing_cached(scenario_json: str, load_csv_text: str | None,
-                      cyclic_soc: bool):
-    """Сайзер: сценарий -> размеры, штуки, метрики, ряды для графиков."""
+                      cyclic_soc: bool, milp: bool = False):
+    """Сайзер: сценарий -> размеры, штуки, метрики, ряды для графиков.
+
+    milp=True — MILP-режим (целые машины + стадирование парка + холостой
+    ход дизеля); медленнее LP, зато честная физика. LP — быстрый дефолт.
+    """
     data = _apply_load(json.loads(scenario_json), load_csv_text)
     scenario = Scenario.model_validate(data)
-    res = optimize_sizing(scenario, weather_csv=WEATHER, write_outputs=False,
-                          cyclic_soc=cyclic_soc)
+    if milp:
+        res = optimize_sizing_milp(scenario, weather_csv=WEATHER,
+                                   write_outputs=False, cyclic_soc=cyclic_soc)
+    else:
+        res = optimize_sizing(scenario, weather_csv=WEATHER, write_outputs=False,
+                              cyclic_soc=cyclic_soc)
     m, tbl = res.sim.manifest, res.sim.table
 
     load_kwh = m["totals_kwh"]["load"]
@@ -108,6 +116,8 @@ def run_sizing_cached(scenario_json: str, load_csv_text: str | None,
         "curtail_kwh": m["totals_kwh"]["curtail"],
         "pv_gen_kwh": m["totals_kwh"]["pv_gen"],
         "solve_seconds": m["solve_seconds"],
+        # Сводка стадирования парка (только в MILP-режиме; иначе None).
+        "staging": m.get("diesel_staging"),
     }
     # Ключи energy_mix — русские и служат ЛИНКАМИ (используются ниже как
     # ключи lookup); переводятся только при отрисовке.
@@ -416,11 +426,23 @@ with st.sidebar.form("params"):
         int(base["battery"]["capex_usd_per_kwh"]), 5,
         help=T("Цена 1 kWh ёмкости накопителя (LFP-шкафы). kWh — сколько "
                "батарея ХРАНИТ; kW — как быстро отдаёт."))
-    fuel_price = st.slider(
-        T("Дизельный kWh, $"), 0.10, 0.60,
-        float(base["diesel"]["fuel_cost_usd_per_kwh"]), 0.01,
-        help=T("Полная стоимость 1 kWh из дизель-генератора. Tornado "
-               "показывает: самый влиятельный параметр модели."))
+    # Топливо дизеля — как у профи (REopt: цена за галлон × расход;
+    # Calliope: cost_flow_in): фундаментальный вход — ЦЕНА ЛИТРА, а
+    # $/кВт*ч выводится = цена_литра × удельный_расход.
+    fuel_price_l = st.slider(
+        T("Цена дизеля, $/литр"), 0.30, 2.50, 0.96, 0.01,
+        help=T("Цена одного литра дизтоплива на площадке (с доставкой). "
+               "Фундаментальный вход у REopt/HOMER; $/кВт*ч выводится из "
+               "неё и удельного расхода. Tornado показывает: самый "
+               "влиятельный параметр модели."))
+    fuel_l_per_kwh = st.slider(
+        T("Удельный расход, л/кВт*ч"), 0.20, 0.40, 0.27, 0.01,
+        help=T("Сколько литров сжигает генсет на 1 кВт*ч на номинале "
+               "(datasheet). Типовой дизель ~0.27. Холостой ход "
+               "(intercept топливной кривой) v1 не моделирует — он "
+               "требует MILP."))
+    st.caption(T("→ эффективно ${}/кВт*ч дизеля").format(
+        f"{fuel_price_l * fuel_l_per_kwh:.3f}"))
 
     st.subheader(T("PV-модуль и инвертор (datasheet)"))
     inv_eff = st.slider(
@@ -484,11 +506,43 @@ with st.sidebar.form("params"):
         T("VOLL, $/kWh (для режима voll)"), 0.1, 20.0, 1.0, 0.1,
         help=T("Value of lost load — цена недопоставленного kWh для "
                "потребителя (простой производства). Дефолт REopt: $1."))
+    reserve_load_pct = st.slider(
+        T("Оперативный резерв, % нагрузки"), 0, 50, 0, 5,
+        help=T("Горячий запас мощности сверх нагрузки в КАЖДЫЙ час "
+               "(REopt operating reserve): недогруженный дизель + "
+               "доступный разряд батареи. Принципиальная замена костылю "
+               "«дизель на весь пик»: закрывает разрыв LP-предвидения и "
+               "слепого контроллера. 0 = выключено."))
+    reserve_pv_pct = st.slider(
+        T("Резерв на PV, %"), 0, 50, 0, 5,
+        help=T("Дополнительный резерв, привязанный к выработке солнца: "
+               "облако роняет PV — запас страхует. Panель сама резерв не "
+               "даёт (она и есть источник неопределённости)."))
     cyclic = st.checkbox(
         T("Циклический SOC (годовое кольцо)"), value=True,
         help=T("Запас батареи в конце года «перетекает» в его начало "
                "(паттерн Calliope) — без бесплатной стартовой заправки. "
                "Выключи для сравнения с REopt-стилем (старт с полной)."))
+
+    st.subheader(T("Точный расчёт парка (MILP)"))
+    milp_on = st.checkbox(
+        T("Целые машины + стадирование дизеля (медленнее)"), value=False,
+        help=T("Вместо непрерывного LP решить MILP: размеры кратны юниту "
+               "(целые панели/шкафы/генсеты), а дизель стадируется по "
+               "часам — «сколько генсетов молотит сейчас» — с минимальной "
+               "загрузкой и расходом на холостой ход. Честнее физика, но "
+               "solver ветвит и считает десятки секунд вместо секунд."))
+    turndown_pct = st.slider(
+        T("Мин. загрузка генсета, %"), 0, 60, 30, 5,
+        help=T("Включённый генсет не опускается ниже этой доли номинала "
+               "(REopt min_turn_down_fraction, дефолт off-grid 15–30%). "
+               "Работает только в MILP-режиме."))
+    idle_lph = st.slider(
+        T("Холостой ход, л/ч на генсет"), 0.0, 30.0, 0.0, 1.0,
+        help=T("Постоянный расход топлива работающего генсета сверх "
+               "нагрузки (intercept топливной кривой REopt). Стоит денег "
+               "даже вхолостую — MILP гасит лишние юниты. 0 = не "
+               "моделировать. Работает только в MILP-режиме."))
 
     submitted = st.form_submit_button(T("Пересчитать"), type="primary",
                                       width="stretch")
@@ -516,7 +570,13 @@ data["pv"]["mount_type"] = mount  # стабильный ключ, не подп
 data["battery"]["capex_usd_per_kwh"] = bess_capex
 data["battery"]["rte_fraction"] = rte
 data["battery"]["max_kwh"] = max_bess
-data["diesel"]["fuel_cost_usd_per_kwh"] = fuel_price
+# Эффективные $/кВт*ч = цена литра × удельный расход. Пишем и цену
+# литра/расход (для BOM/KPI), и производный $/кВт*ч (им считают деньги
+# все слои, и его же качает tornado-свип).
+eff_fuel_usd_per_kwh = round(fuel_price_l * fuel_l_per_kwh, 4)
+data["diesel"]["fuel_price_usd_per_liter"] = fuel_price_l
+data["diesel"]["fuel_liters_per_kwh"] = fuel_l_per_kwh
+data["diesel"]["fuel_cost_usd_per_kwh"] = eff_fuel_usd_per_kwh
 data["diesel"]["max_kw"] = max_dg
 data["site"]["roof_area_m2"] = roof
 data["reliability"] = (
@@ -525,13 +585,24 @@ data["reliability"] = (
     rel_mode == "lpsp" else
     {"mode": "voll", "voll_usd_per_kwh": voll}
 )
+# Оперативный резерв — необязательная надстройка поверх любого режима.
+if reserve_load_pct:
+    data["reliability"]["operating_reserve_load_fraction"] = reserve_load_pct / 100
+if reserve_pv_pct:
+    data["reliability"]["operating_reserve_pv_fraction"] = reserve_pv_pct / 100
+# Параметры дизеля для MILP-режима (в LP-режиме игнорируются оптимизатором).
+if milp_on and data.get("diesel"):
+    if turndown_pct:
+        data["diesel"]["min_turn_down_fraction"] = turndown_pct / 100
+    if idle_lph:
+        data["diesel"]["fuel_idle_liters_per_hour"] = idle_lph
 scenario_json = json.dumps(data, sort_keys=True)
 
 # ============================ запуск ядра ============================
 
 try:
     sizes, units, metrics, energy_mix, week = run_sizing_cached(
-        scenario_json, load_csv_text, cyclic)
+        scenario_json, load_csv_text, cyclic, milp_on)
 except RuntimeError as e:
     st.error(T("Оптимизация не удалась: {}").format(e))
     st.stop()
@@ -548,6 +619,12 @@ base_sizes, base_metrics = st.session_state.baseline
 st.title(T("Оптимальная конфигурация"))
 st.caption(T("Решено за {} c · дельты — против зафиксированной базы "
              "(кнопка в сайдбаре)").format(metrics["solve_seconds"]))
+if metrics.get("staging"):
+    s = metrics["staging"]
+    st.caption(T("MILP-парк: {} генсет(ов) по {:g} kW · одновременно в работе "
+                 "до {}, в среднем {} · целые машины и стадирование по часам")
+               .format(s["dg_units_installed"], s["dg_unit_kw"],
+                       s["dg_units_on_max"], s["dg_units_on_mean"]))
 
 
 def delta(cur, ref):

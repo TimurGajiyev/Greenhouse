@@ -60,6 +60,7 @@ from src.simulate import (
 
 SOURCE_MODEL_DISPATCH = "lp_v1"
 SOURCE_MODEL_SIZING = "lp_sizing_v1"
+SOURCE_MODEL_MILP = "milp_sizing_v1"
 
 # ASSUMPTION: VOLL по дефолту = $1.00/kWh — дефолт REopt
 # (core/financial.jl, value_of_lost_load_per_kwh); уточнить у заказчика
@@ -131,6 +132,13 @@ def optimize_dispatch(
     v = _build_lp_core(
         prob, scenario, n, dt_hours, load_arr, solar_arr, sizes,
         cyclic_soc=cyclic_soc,
+    )
+
+    # Оперативный резерв: свободная мощность дизеля = весь размер минус
+    # текущая выработка (в dispatch размер — константа).
+    dg_headroom = [sizes["dg_kw"] - v["dg"][t] for t in range(n)]
+    _add_operating_reserve(
+        prob, scenario, n, dt_hours, load_arr, solar_arr, sizes, v, dg_headroom
     )
 
     fuel_price = scenario.diesel.fuel_cost_usd_per_kwh if scenario.diesel else 0.0
@@ -209,6 +217,14 @@ def optimize_sizing(
     v = _build_lp_core(
         prob, scenario, n, dt_hours, load_arr, solar_arr, sizes,
         cyclic_soc=cyclic_soc,
+    )
+
+    # Оперативный резерв (свободная мощность дизеля = размер-переменная
+    # минус выработка). Требование резерва тянет размеры дизеля/батареи
+    # вверх ровно настолько, чтобы держать горячий запас каждый час.
+    dg_headroom = [sizes["dg_kw"] - v["dg"][t] for t in range(n)]
+    _add_operating_reserve(
+        prob, scenario, n, dt_hours, load_arr, solar_arr, sizes, v, dg_headroom
     )
 
     # --- целевая функция: годовой эквивалент капитала + O&M + топливо ---
@@ -305,6 +321,259 @@ def optimize_sizing(
     return SizingResult(sizes=solved_sizes, units=units, sim=sim)
 
 
+def optimize_sizing_milp(
+    scenario: Scenario,
+    weather_csv: str | None = None,
+    results_dir: str = "results",
+    write_outputs: bool = True,
+    cyclic_soc: bool = True,
+    solver: str | None = None,
+    time_limit: float | None = 120.0,
+    gap: float | None = 0.01,
+    lp_snapshot_path: str | None = None,
+) -> SizingResult:
+    """Шаг A: MILP-сайзинг парка — целые машины + честная физика дизеля.
+
+    Три улучшения группы A в одной формулировке (паттерн Calliope
+    units/operating_units + REopt binGenIsOnInTS):
+
+      A2 — целочисленный сайзинг: размеры не непрерывны, а КРАТНЫ юниту
+           (dg_kw = dg_units * unit_kw, аналогично PV-панели, шкафы,
+           PCS). Экономика считается по реально закупаемому железу.
+      A1 — топливо с холостым ходом: расход = наклон*выработка +
+           intercept*работающие_юниты (REopt fuel_slope+intercept).
+      A3 — стадирование парка: dg_op[t] (целое, ≤ установленных юнитов)
+           — «сколько генсетов молотит в этот час»; включённый юнит
+           обязан выдавать ≥ min_turn_down доли номинала.
+
+    Расплата за целочисленность — ветвление (branch-and-bound): солвер
+    медленнее LP. Параметры time_limit (сек) и gap (относительный зазор
+    оптимальности, 0.01 = 1%) держат время под контролем; для тесных
+    годовых задач добавь редукцию ряда (типовые сутки) на входе.
+
+    Требует unit-размеров у присутствующих технологий (иначе штук нет);
+    у дизеля unit_kw обязателен — без размера юнита нельзя стадировать.
+    """
+    load, dt_hours, solar_unit = prepare_series(scenario, weather_csv)
+    load_arr = load.to_numpy(dtype=float)
+    solar_arr = solar_unit.to_numpy(dtype=float)
+    n = len(load_arr)
+    rate = scenario.financial.discount_rate_fraction
+
+    prob = pulp.LpProblem("greenhouse_sizing_milp", pulp.LpMinimize)
+
+    # --- размеры как ЦЕЛОЕ число юнитов (A2) ---
+    # size = units * unit_size; при отсутствии unit-размера технология
+    # остаётся непрерывной (integer-сайзинг для неё просто не запрошен).
+    sizes = {"pv_kwp": 0.0, "batt_kwh": 0.0, "batt_kw": 0.0, "dg_kw": 0.0}
+    unit_vars: dict = {}
+
+    def _int_units(name, unit, min_kw, max_kw):
+        """Целочисленная переменная «число юнитов» в границах коридора.
+
+        Границы в штуках: снизу ceil(min/unit) (уважаем нижний порог),
+        сверху floor(max/unit) (не превышаем потолок). Если коридор уже
+        одного юнита (частый случай — ФИКСИРОВАННЫЙ размер min==max, не
+        кратный юниту: 1200 кВт генсетами по 500), берём ближайшее целое
+        число юнитов к середине — целыми машинами точную дробь не купить.
+        """
+        lo = max(0, math.ceil(min_kw / unit - 1e-9))
+        hi = math.floor(max_kw / unit + 1e-9)
+        if hi < lo:
+            hi = lo = max(0, round((min_kw + max_kw) / 2 / unit))
+        return prob.add_variable(name, lowBound=lo, upBound=hi, cat="Integer")
+
+    if scenario.pv is not None:
+        if scenario.pv.unit_kw:
+            unit_vars["pv"] = _int_units(
+                "units_pv", scenario.pv.unit_kw,
+                scenario.pv.min_kw, scenario.pv.max_kw,
+            )
+            sizes["pv_kwp"] = unit_vars["pv"] * scenario.pv.unit_kw
+        else:
+            sizes["pv_kwp"] = prob.add_variable(
+                "size_pv_kwp", lowBound=scenario.pv.min_kw,
+                upBound=scenario.pv.max_kw,
+            )
+    if scenario.battery is not None:
+        b = scenario.battery
+        if b.unit_kwh:
+            unit_vars["batt_cab"] = _int_units(
+                "units_batt_cab", b.unit_kwh, b.min_kwh, b.max_kwh)
+            sizes["batt_kwh"] = unit_vars["batt_cab"] * b.unit_kwh
+        else:
+            sizes["batt_kwh"] = prob.add_variable(
+                "size_batt_kwh", lowBound=b.min_kwh, upBound=b.max_kwh)
+        if b.unit_kw:
+            unit_vars["batt_pcs"] = _int_units(
+                "units_batt_pcs", b.unit_kw, b.min_kw, b.max_kw)
+            sizes["batt_kw"] = unit_vars["batt_pcs"] * b.unit_kw
+        else:
+            sizes["batt_kw"] = prob.add_variable(
+                "size_batt_kw", lowBound=b.min_kw, upBound=b.max_kw)
+
+    dg_op = None
+    dg_unit_kw = None
+    if scenario.diesel is not None:
+        d = scenario.diesel
+        if not d.unit_kw:
+            raise RuntimeError(
+                "MILP: у дизеля обязателен unit_kw (размер одного генсета) "
+                "— без него нельзя стадировать парк"
+            )
+        dg_unit_kw = d.unit_kw
+        unit_vars["dg"] = _int_units(
+            "units_dg", d.unit_kw, d.min_kw, d.max_kw)
+        sizes["dg_kw"] = unit_vars["dg"] * d.unit_kw
+        # A3: сколько юнитов РАБОТАЕТ в каждый час (целое, ≤ установленных).
+        hi = int(math.floor(d.max_kw / d.unit_kw + 1e-9))
+        dg_op = prob.add_variable_dicts(
+            "dg_units_on", range(n), lowBound=0, upBound=hi, cat="Integer")
+
+    v = _build_lp_core(
+        prob, scenario, n, dt_hours, load_arr, solar_arr, sizes,
+        cyclic_soc=cyclic_soc,
+    )
+
+    # --- A1/A3: стадирование парка и минимальная загрузка ---
+    if scenario.diesel is not None:
+        turn_down = scenario.diesel.min_turn_down_fraction or 0.0
+        for t in range(n):
+            # Работать могут только установленные юниты.
+            prob += dg_op[t] <= unit_vars["dg"], f"dg_units_avail_{t}"
+            # Выдача ≤ мощности РАБОТАЮЩИХ юнитов (стоящий даёт 0).
+            prob += v["dg"][t] <= dg_op[t] * dg_unit_kw, f"dg_stage_cap_{t}"
+            # Включённый юнит не опускается ниже полки min_turn_down.
+            if turn_down:
+                prob += (
+                    v["dg"][t] >= dg_op[t] * dg_unit_kw * turn_down
+                ), f"dg_min_load_{t}"
+
+    # --- оперативный резерв: у дизеля резерв дают ТОЛЬКО работающие юниты ---
+    if scenario.diesel is not None:
+        dg_headroom = [dg_op[t] * dg_unit_kw - v["dg"][t] for t in range(n)]
+    else:
+        dg_headroom = [0.0 for _ in range(n)]
+    _add_operating_reserve(
+        prob, scenario, n, dt_hours, load_arr, solar_arr, sizes, v, dg_headroom
+    )
+
+    # --- целевая функция ---
+    objective = []
+    if scenario.pv is not None:
+        crf_pv = capital_recovery_factor(rate, scenario.pv.lifetime_years)
+        objective.append(
+            (crf_pv * scenario.pv.capex_usd_per_kw
+             + scenario.pv.om_usd_per_kw_year) * sizes["pv_kwp"]
+        )
+    if scenario.battery is not None:
+        b = scenario.battery
+        crf_b = capital_recovery_factor(rate, b.lifetime_years)
+        objective.append(
+            (crf_b * b.capex_usd_per_kwh + b.om_usd_per_kwh_year)
+            * sizes["batt_kwh"]
+        )
+        objective.append(crf_b * b.capex_usd_per_kw * sizes["batt_kw"])
+    if scenario.diesel is not None:
+        d = scenario.diesel
+        crf_d = capital_recovery_factor(rate, d.lifetime_years)
+        objective.append(
+            (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year) * sizes["dg_kw"]
+        )
+        # Топливо: маргинальный расход на выработку...
+        objective.append(
+            pulp.lpSum(
+                dt_hours * d.fuel_cost_usd_per_kwh * v["dg"][t] for t in range(n)
+            )
+        )
+        # ...плюс ПОСТОЯННЫЙ расход холостого хода на каждый работающий юнит
+        # (A1, intercept): $ = цена_литра * литров/час * работающие_юниты.
+        idle_l = d.fuel_idle_liters_per_hour or 0.0
+        if idle_l:
+            price_l = d.fuel_price_usd_per_liter
+            objective.append(
+                pulp.lpSum(
+                    dt_hours * price_l * idle_l * dg_op[t] for t in range(n)
+                )
+            )
+
+    # надёжность (та же, что в LP-сайзере)
+    mode = scenario.reliability.mode
+    total_shortfall_kwh = pulp.lpSum(
+        dt_hours * v["shortfall"][t] for t in range(n)
+    )
+    if mode == "hard":
+        prob += total_shortfall_kwh == 0, "reliability_hard"
+    elif mode == "lpsp":
+        total_load_kwh = float(load_arr.sum() * dt_hours)
+        prob += (
+            total_shortfall_kwh
+            <= scenario.reliability.lpsp_max_fraction * total_load_kwh
+        ), "reliability_lpsp"
+    else:
+        objective.append(
+            scenario.reliability.voll_usd_per_kwh * total_shortfall_kwh
+        )
+
+    # микроштраф от вырожденности — на непрерывные/целые размеры
+    objective.append(
+        pulp.lpSum(
+            SIZE_TIEBREAK_USD * s
+            for s in sizes.values()
+            if isinstance(s, (pulp.LpVariable, pulp.LpAffineExpression))
+        )
+    )
+    prob += pulp.lpSum(objective)
+
+    # площадь под панели
+    if scenario.pv is not None and scenario.site.roof_area_m2 is not None:
+        m2_per_kwp = scenario.pv.m2_per_kwp or DEFAULT_M2_PER_KWP
+        prob += (
+            sizes["pv_kwp"] * m2_per_kwp <= scenario.site.roof_area_m2
+        ), "roof_area"
+
+    if lp_snapshot_path is not None:
+        prob.writeLP(lp_snapshot_path)
+
+    solver_info = _solve(prob, solver, time_limit=time_limit, gap=gap)
+
+    def _val(x):
+        return float(x) if isinstance(x, (int, float)) else float(pulp.value(x))
+
+    solved_sizes = {k: _val(s) for k, s in sizes.items()}
+    units = _sizes_to_units(scenario, solved_sizes)
+
+    # Сводка стадирования: сколько юнитов установлено и как парк дышит.
+    staging = None
+    if scenario.diesel is not None:
+        on = [int(round(pulp.value(dg_op[t]))) for t in range(n)]
+        staging = {
+            "dg_unit_kw": dg_unit_kw,
+            "dg_units_installed": int(round(pulp.value(unit_vars["dg"]))),
+            "dg_units_on_max": max(on),
+            "dg_units_on_mean": round(sum(on) / n, 3),
+            "min_turn_down_fraction": scenario.diesel.min_turn_down_fraction,
+            "fuel_idle_liters_per_hour": scenario.diesel.fuel_idle_liters_per_hour,
+        }
+
+    sim = _extract_result(
+        scenario, load, dt_hours, solar_unit, solved_sizes, v,
+        source_model=SOURCE_MODEL_MILP,
+        solver_info=solver_info,
+        results_dir=results_dir,
+        write_outputs=write_outputs,
+        extra={
+            "sizes": {k: round(x, 3) for k, x in solved_sizes.items()},
+            "units": units,
+            "reliability_mode": mode,
+            "cyclic_soc": cyclic_soc,
+            "milp": True,
+            "diesel_staging": staging,
+        },
+    )
+    return SizingResult(sizes=solved_sizes, units=units, sim=sim)
+
+
 # ---------- приватные помощники ----------
 
 
@@ -354,6 +623,10 @@ def _build_lp_core(
     # soc_init_fraction=1.0); в sizing это 1.0 * batt_kwh_var — линейно.
     soc_init = sizes["batt_kwh"]
 
+    # "Предыдущий" запас каждого шага — понадобится слою резерва
+    # (сколько ещё разряда доступно над полом soc_min).
+    soc_prev = {}
+
     for t in range(n):
         pv_gen_t = sizes["pv_kwp"] * solar_arr[t]
 
@@ -377,6 +650,7 @@ def _build_lp_core(
             prev = soc[n - 1] if cyclic_soc else soc_init
         else:
             prev = soc[t - 1]
+        soc_prev[t] = prev
 
         # SOC-динамика (REopt 4g + саморазряд Calliope).
         prob += (
@@ -393,13 +667,99 @@ def _build_lp_core(
     return {
         "charge": charge, "discharge": discharge, "dg": dg,
         "curtail": curtail, "shortfall": shortfall, "soc": soc,
-        "eta": eta,
+        "eta": eta, "decay": decay, "soc_min_frac": soc_min_frac,
+        "soc_prev": soc_prev,
     }
 
 
-def _solve(prob: pulp.LpProblem, preference: str | None = None) -> dict:
-    """Решает LP и возвращает паспорт солвера; не-Optimal — ошибка."""
-    solver_name, solver = _pick_solver(preference)
+def _add_operating_reserve(
+    prob: pulp.LpProblem,
+    scenario: Scenario,
+    n: int,
+    dt_hours: float,
+    load_arr,
+    solar_arr,
+    sizes: dict,
+    v: dict,
+    dg_headroom,
+) -> None:
+    """Оперативный резерв (REopt operating_reserve_constraints.jl).
+
+    В каждый час предоставленный резерв обязан покрыть требуемый:
+      предоставляют — недогруженный дизель и свободный разряд батареи;
+      требуют — доля нагрузки и доля выработки PV (страховка от облаков).
+    Panель сама резерв НЕ даёт: она и есть источник неопределённости.
+
+    dg_headroom — список выражений «свободная мощность дизеля в час t»:
+      LP  — sizes["dg_kw"] - dg[t] (весь установленный минус выработка);
+      MILP — dg_op[t]*unit_kw - dg[t] (только РАБОТАЮЩИЕ юниты — стоящий
+      генсет вращающийся резерв не держит, как binGenIsOnInTS в REopt).
+
+    Ничего не добавляет, если обе доли резерва не заданы (обратная
+    совместимость: старые сценарии считаются ровно как раньше).
+    """
+    rel = scenario.reliability
+    res_load = rel.operating_reserve_load_fraction or 0.0
+    res_pv = rel.operating_reserve_pv_fraction or 0.0
+    if not res_load and not res_pv:
+        return
+
+    has_batt = scenario.battery is not None
+    has_dg = scenario.diesel is not None
+    eta = v["eta"]
+    decay = v["decay"]
+    soc_min_frac = v["soc_min_frac"]
+
+    op_dg = (
+        prob.add_variable_dicts("opres_dg_kw", range(n), lowBound=0)
+        if has_dg else None
+    )
+    op_bt = (
+        prob.add_variable_dicts("opres_batt_kw", range(n), lowBound=0)
+        if has_batt else None
+    )
+
+    for t in range(n):
+        provided = []
+        if has_dg:
+            # Свободная мощность генсета над текущей выработкой.
+            prob += op_dg[t] <= dg_headroom[t], f"opres_dg_cap_{t}"
+            provided.append(op_dg[t])
+        if has_batt:
+            prev = v["soc_prev"][t]
+            # Энергия: максимум AC-разряда над полом soc_min за шаг,
+            # минус уже отдаваемый разряд (совпадает с available_kw
+            # rule-симулятора: (soc - soc_min)*η/Δt).
+            prob += (
+                op_bt[t]
+                <= (decay * prev - soc_min_frac * sizes["batt_kwh"])
+                * eta / dt_hours - v["discharge"][t]
+            ), f"opres_batt_energy_{t}"
+            # Мощность: свободный разрядный канал PCS.
+            prob += (
+                op_bt[t] <= sizes["batt_kw"] - v["discharge"][t]
+            ), f"opres_batt_power_{t}"
+            provided.append(op_bt[t])
+        required = (
+            res_load * load_arr[t]
+            + res_pv * sizes["pv_kwp"] * solar_arr[t]
+        )
+        prob += pulp.lpSum(provided) >= required, f"opres_req_{t}"
+
+
+def _solve(
+    prob: pulp.LpProblem,
+    preference: str | None = None,
+    time_limit: float | None = None,
+    gap: float | None = None,
+) -> dict:
+    """Решает (MI)LP и возвращает паспорт солвера; не-Optimal — ошибка.
+
+    time_limit / gap — только для MILP: предел времени в секундах и
+    относительный зазор оптимальности (0.01 = принять решение в пределах
+    1% от доказанного оптимума). У чистого LP зазора нет — оба None.
+    """
+    solver_name, solver = _pick_solver(preference, time_limit, gap)
     started = time.perf_counter()
     prob.solve(solver)
     solve_seconds = time.perf_counter() - started
@@ -512,26 +872,40 @@ def _sizes_to_units(scenario: Scenario, sizes: dict) -> dict:
     }
 
 
-def _pick_solver(preference: str | None = None):
+def _pick_solver(
+    preference: str | None = None,
+    time_limit: float | None = None,
+    gap: float | None = None,
+):
     """Выбор солвера.
 
     preference: "highs" / "cbc" — взять именно этот (для кросс-
     солверной сверки: два НЕЗАВИСИМЫХ солвера обязаны дать один
     оптимум); None — HiGHS, а если недоступен, честный откат на CBC.
+    time_limit / gap — предел времени и зазор оптимальности для MILP
+    (HiGHS/CBC умеют целочисленность; параметры игнорируются, если None).
     """
+    def _kw():
+        kw = {"msg": False}
+        if time_limit is not None:
+            kw["timeLimit"] = time_limit
+        if gap is not None:
+            kw["gapRel"] = gap
+        return kw
+
     if preference is not None:
         name = preference.lower()
         if name == "highs":
-            return "HiGHS", pulp.HiGHS(msg=False)
+            return "HiGHS", pulp.HiGHS(**_kw())
         if name == "cbc":
-            return "CBC", pulp.PULP_CBC_CMD(msg=False)
+            return "CBC", pulp.PULP_CBC_CMD(**_kw())
         raise ValueError(f"Неизвестный солвер {preference!r}: жду 'highs' или 'cbc'")
 
     try:
-        solver = pulp.HiGHS(msg=False)
+        solver = pulp.HiGHS(**_kw())
         if solver.available():
             return "HiGHS", solver
     except Exception:
         pass
     warnings.warn("HiGHS недоступен — решаю запасным CBC (медленнее)")
-    return "CBC", pulp.PULP_CBC_CMD(msg=False)
+    return "CBC", pulp.PULP_CBC_CMD(**_kw())

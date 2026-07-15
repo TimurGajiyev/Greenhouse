@@ -173,24 +173,47 @@ class DieselConfig(BaseModel):
     capex_usd_per_kw: float = Field(gt=0)
     om_usd_per_kw_year: float = Field(ge=0)
 
-    # Стоимость 1 кВт*ч из дизеля. Упрощение v1: плоский тариф; PDF
-    # даёт готовые 0.26 $/кВт*ч. Реальная топливная кривая генсета
-    # (расход холостого хода + наклон, как fuel_intercept/fuel_slope
-    # в REopt и HOMER) — сознательно отложена: она делает цену kWh
-    # зависящей от загрузки и требует MILP. См. отчёт шага 6.
-    fuel_cost_usd_per_kwh: float = Field(gt=0)
+    # Стоимость 1 кВт*ч из дизеля — КАНОНИЧЕСКОЕ поле, которым считают
+    # деньги все слои. Задать его можно ДВУМЯ способами:
+    #   (а) напрямую, как $/кВт*ч (плоский тариф, как в вендорском PDF);
+    #   (б) через цену литра × удельный расход (как в REopt/HOMER:
+    #       fuel_cost_per_gallon × fuel_slope_gal_per_kwh) — тогда это
+    #       поле можно НЕ задавать, валидатор выведет его сам.
+    # None разрешён только если задана пара (fuel_price_usd_per_liter,
+    # fuel_liters_per_kwh). Топливная кривая с холостым ходом (intercept)
+    # по-прежнему отложена — она требует MILP.
+    fuel_cost_usd_per_kwh: float | None = Field(default=None, gt=0)
 
-    # Удельный расход топлива, литров на кВт*ч (опционально, новое в
-    # шаге 6). Если задан — KPI-слой посчитает ЛИТРЫ за год (для
-    # планирования завоза топлива, резерв площадки 20 000 л). Деньги
-    # v1 всё равно считает через fuel_cost_usd_per_kwh.
+    # Цена ОДНОГО ЛИТРА дизеля (опционально, v1.1). Фундаментальный вход
+    # у профи (REopt — цена за галлон, Calliope — cost_flow_in). Вместе с
+    # fuel_liters_per_kwh даёт эффективные $/кВт*ч = цена_литра * л/кВт*ч.
+    fuel_price_usd_per_liter: float | None = Field(default=None, gt=0)
+
+    # Удельный расход топлива, литров на кВт*ч (опционально). Нужен и для
+    # KPI (литры за год под завоз топлива), и для перевода цены литра в
+    # $/кВт*ч. Типовой генсет на номинале — ~0.27 л/кВт*ч.
     fuel_liters_per_kwh: float | None = Field(default=None, gt=0)
 
     min_kw: float = Field(ge=0)
     max_kw: float = Field(gt=0)
 
-    # Мощность одного генсета (1000 кВт) — для перевода в штуки.
+    # Мощность одного генсета (1000 кВт) — для перевода в штуки И как
+    # размер юнита в MILP-режиме (парк из целых машин).
     unit_kw: float | None = Field(default=None, gt=0)
+
+    # --- поля MILP-режима (unit commitment, шаг A) ---
+    # Минимальная загрузка РАБОТАЮЩЕГО генсета, доля номинала: включённый
+    # юнит обязан выдавать не меньше (REopt min_turn_down_fraction, дефолт
+    # off-grid 0.15). None = 0 (без нижней полки; юнит может работать в
+    # любой точке). Используется только оптимизатором MILP.
+    min_turn_down_fraction: float | None = Field(default=None, ge=0, le=1)
+
+    # Расход на ХОЛОСТОЙ ход, литров в час на ОДИН работающий юнит —
+    # постоянная составляющая топливной кривой (intercept в REopt:
+    # fuel_intercept_gal_per_hr). Стоит денег, даже когда генсет почти не
+    # нагружен, — поэтому MILP гасит лишние юниты. Требует
+    # fuel_price_usd_per_liter, чтобы перевести литры в деньги. None = 0.
+    fuel_idle_liters_per_hour: float | None = Field(default=None, ge=0)
 
     lifetime_years: int = Field(gt=0)
 
@@ -198,6 +221,26 @@ class DieselConfig(BaseModel):
     def validate_size_corridor(self):
         if self.max_kw < self.min_kw:
             raise ValueError("Diesel: max_kw не может быть меньше min_kw")
+        # Холостой ход задан, но нечем оценить его в деньгах.
+        if (
+            self.fuel_idle_liters_per_hour
+            and self.fuel_price_usd_per_liter is None
+        ):
+            raise ValueError(
+                "Diesel: fuel_idle_liters_per_hour требует "
+                "fuel_price_usd_per_liter (перевод литров холостого хода в $)"
+            )
+        # Топливо: если $/кВт*ч не задан напрямую — вывести из цены литра.
+        if self.fuel_cost_usd_per_kwh is None:
+            if self.fuel_price_usd_per_liter is None or \
+                    self.fuel_liters_per_kwh is None:
+                raise ValueError(
+                    "Diesel: задай ЛИБО fuel_cost_usd_per_kwh, ЛИБО пару "
+                    "fuel_price_usd_per_liter + fuel_liters_per_kwh"
+                )
+            self.fuel_cost_usd_per_kwh = (
+                self.fuel_price_usd_per_liter * self.fuel_liters_per_kwh
+            )
         return self
 
 
@@ -286,6 +329,32 @@ class ReliabilityConfig(BaseModel):
     # Параметры режимов; каждый обязателен ровно для своего режима.
     lpsp_max_fraction: float | None = Field(default=None, gt=0, lt=1)
     voll_usd_per_kwh: float | None = Field(default=None, gt=0)
+
+    # Operating reserve (оперативный/вращающийся резерв) — необязательная
+    # политика ПОВЕРХ основного режима, перенос из REopt
+    # (operating_reserve_constraints.jl). В КАЖДЫЙ час система обязана
+    # держать свободную мощность СВЕРХ текущей выработки: недогруженный
+    # дизель (dg_kw - dg[t]) плюс доступный разряд батареи. Требуемый
+    # резерв = доля нагрузки + доля выработки PV (солнце капризно —
+    # облако роняет генерацию, резерв это страхует).
+    #
+    # Зачем это, а не прежний костыль diesel_firm_fraction (dg_kw >= доля
+    # пика): LP-сайзер с идеальным предвидением режет дизель почти в ноль,
+    # опираясь на батарею, и слепой контроллер потом даёт недопоставку
+    # (battle-тест Феникса: 2.4% LPSP). Резерв закрывает это ПРИНЦИПИАЛЬНО
+    # — час за часом требует горячий запас мощности, а не грубо «дизель на
+    # весь пик»; резерв может дать и батарея. Аналог
+    # operating_reserve_required_fraction (на нагрузку) и
+    # techs_operating_reserve_req_fraction (на PV) в REopt.
+    #
+    # Доля резерва от НАГРУЗКИ каждого часа (0.10 = держать 10% сверх).
+    operating_reserve_load_fraction: float | None = Field(
+        default=None, ge=0, le=1
+    )
+    # Доля резерва от ВЫРАБОТКИ PV каждого часа (страховка от облаков).
+    operating_reserve_pv_fraction: float | None = Field(
+        default=None, ge=0, le=1
+    )
 
     @model_validator(mode="after")
     def validate_mode_params(self):

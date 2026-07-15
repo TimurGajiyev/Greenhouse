@@ -63,7 +63,9 @@ def test_app_sidebar_has_overrides(app):
     """Ключевые ползунки-overrides существуют (паттерн Calliope)."""
     labels = [s.label for s in app.sidebar.slider]
     assert any("CAPEX PV" in l for l in labels)
-    assert any("Дизельный kWh" in l for l in labels)
+    # Топливо теперь задаётся ценой литра (как в REopt/HOMER).
+    assert any("Цена дизеля, $/литр" in l for l in labels)
+    assert any("Удельный расход" in l for l in labels)
 
 
 def test_app_sidebar_glossary(app):

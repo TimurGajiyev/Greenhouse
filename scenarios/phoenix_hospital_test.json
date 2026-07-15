@@ -1,0 +1,57 @@
+{
+  "name": "Phoenix Hospital off-grid microgrid [reference]",
+  "site": {
+    "name": "Phoenix, AZ — hospital (NREL CRB profile)",
+    "latitude": 33.4484,
+    "longitude": -112.074,
+    "timezone": "America/Phoenix",
+    "roof_area_m2": 40000
+  },
+  "pv": {
+    "capex_usd_per_kw": 1200,
+    "om_usd_per_kw_year": 16,
+    "min_kw": 2500.0,
+    "max_kw": 2500.0,
+    "unit_kw": 0.58,
+    "mount_type": "open_rack",
+    "gamma_pdc_per_c": -0.0035,
+    "inverter_eff_fraction": 0.97,
+    "lifetime_years": 25
+  },
+  "battery": {
+    "capex_usd_per_kwh": 350,
+    "capex_usd_per_kw": 150,
+    "om_usd_per_kwh_year": 4,
+    "rte_fraction": 0.9,
+    "soc_min_fraction": 0.15,
+    "self_discharge_fraction_per_hour": 2e-05,
+    "min_kwh": 6000.0,
+    "max_kwh": 6000.0,
+    "min_kw": 2000.0,
+    "max_kw": 2000.0,
+    "unit_kwh": 261,
+    "unit_kw": 125,
+    "lifetime_years": 10
+  },
+  "diesel": {
+    "capex_usd_per_kw": 500,
+    "om_usd_per_kw_year": 20,
+    "fuel_cost_usd_per_kwh": 0.32,
+    "fuel_liters_per_kwh": 0.27,
+    "min_kw": 1200.0,
+    "max_kw": 1200.0,
+    "unit_kw": 500,
+    "lifetime_years": 15
+  },
+  "load": {
+    "profile_csv": "scenarios\\phoenix_hospital_load.csv"
+  },
+  "financial": {
+    "discount_rate_fraction": 0.08,
+    "project_years": 20,
+    "currency": "USD"
+  },
+  "reliability": {
+    "mode": "hard"
+  }
+}

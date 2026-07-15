@@ -49,11 +49,24 @@ TRANSLATIONS: dict[str, str] = {
     "батарея ХРАНИТ; kW — как быстро отдаёт.":
         "Price of 1 kWh of storage capacity (LFP cabinets). kWh — how much "
         "the battery STORES; kW — how fast it delivers.",
-    "Дизельный kWh, $": "Diesel kWh, $",
-    "Полная стоимость 1 kWh из дизель-генератора. Tornado "
-    "показывает: самый влиятельный параметр модели.":
-        "Full cost of 1 kWh from the diesel generator. Tornado shows it is "
-        "the most influential parameter of the model.",
+    "Цена дизеля, $/литр": "Diesel price, $/liter",
+    "Цена одного литра дизтоплива на площадке (с доставкой). "
+    "Фундаментальный вход у REopt/HOMER; $/кВт*ч выводится из "
+    "неё и удельного расхода. Tornado показывает: самый "
+    "влиятельный параметр модели.":
+        "Price of one liter of diesel on site (delivered). The fundamental "
+        "input in REopt/HOMER; $/kWh is derived from it and the fuel "
+        "consumption. Tornado shows it is the most influential parameter of "
+        "the model.",
+    "Удельный расход, л/кВт*ч": "Fuel consumption, L/kWh",
+    "Сколько литров сжигает генсет на 1 кВт*ч на номинале "
+    "(datasheet). Типовой дизель ~0.27. Холостой ход "
+    "(intercept топливной кривой) v1 не моделирует — он "
+    "требует MILP.":
+        "How many liters the genset burns per 1 kWh at rated load "
+        "(datasheet). A typical diesel ~0.27. Idle burn (the fuel-curve "
+        "intercept) is not modeled in v1 — it requires MILP.",
+    "→ эффективно ${}/кВт*ч дизеля": "→ effectively ${}/kWh of diesel",
 
     # ---------- PV-модуль ----------
     "PV-модуль и инвертор (datasheet)": "PV module & inverter (datasheet)",
@@ -127,6 +140,24 @@ TRANSLATIONS: dict[str, str] = {
     "потребителя (простой производства). Дефолт REopt: $1.":
         "Value of lost load — price of an unserved kWh to the consumer "
         "(production downtime). REopt default: $1.",
+    "Оперативный резерв, % нагрузки": "Operating reserve, % of load",
+    "Горячий запас мощности сверх нагрузки в КАЖДЫЙ час "
+    "(REopt operating reserve): недогруженный дизель + "
+    "доступный разряд батареи. Принципиальная замена костылю "
+    "«дизель на весь пик»: закрывает разрыв LP-предвидения и "
+    "слепого контроллера. 0 = выключено.":
+        "Hot power headroom above the load EVERY hour (REopt operating "
+        "reserve): the underloaded diesel + the battery’s available "
+        "discharge. A principled replacement for the “diesel on the whole "
+        "peak” hack: it closes the gap between LP foresight and a blind "
+        "controller. 0 = off.",
+    "Резерв на PV, %": "Reserve on PV, %",
+    "Дополнительный резерв, привязанный к выработке солнца: "
+    "облако роняет PV — запас страхует. Panель сама резерв не "
+    "даёт (она и есть источник неопределённости).":
+        "Extra reserve tied to solar output: a cloud drops PV — the "
+        "headroom insures against it. The panel itself provides no reserve "
+        "(it is the source of uncertainty).",
     "Циклический SOC (годовое кольцо)": "Cyclic SOC (annual ring)",
     "Запас батареи в конце года «перетекает» в его начало "
     "(паттерн Calliope) — без бесплатной стартовой заправки. "
@@ -134,6 +165,39 @@ TRANSLATIONS: dict[str, str] = {
         "The battery charge at year end “flows” into its start (Calliope "
         "pattern) — no free initial charge. Turn off to compare with the "
         "REopt style (start full).",
+    "Точный расчёт парка (MILP)": "Exact fleet model (MILP)",
+    "Целые машины + стадирование дизеля (медленнее)":
+        "Whole machines + diesel staging (slower)",
+    "Вместо непрерывного LP решить MILP: размеры кратны юниту "
+    "(целые панели/шкафы/генсеты), а дизель стадируется по "
+    "часам — «сколько генсетов молотит сейчас» — с минимальной "
+    "загрузкой и расходом на холостой ход. Честнее физика, но "
+    "solver ветвит и считает десятки секунд вместо секунд.":
+        "Instead of the continuous LP, solve a MILP: sizes are multiples of "
+        "the unit (whole panels/cabinets/gensets), and diesel is staged by "
+        "the hour — “how many gensets run now” — with a minimum load and "
+        "idle burn. More honest physics, but the solver branches and takes "
+        "tens of seconds instead of seconds.",
+    "Мин. загрузка генсета, %": "Min genset load, %",
+    "Включённый генсет не опускается ниже этой доли номинала "
+    "(REopt min_turn_down_fraction, дефолт off-grid 15–30%). "
+    "Работает только в MILP-режиме.":
+        "A running genset stays above this fraction of its rating (REopt "
+        "min_turn_down_fraction, off-grid default 15–30%). Works only in "
+        "MILP mode.",
+    "Холостой ход, л/ч на генсет": "Idle burn, L/h per genset",
+    "Постоянный расход топлива работающего генсета сверх "
+    "нагрузки (intercept топливной кривой REopt). Стоит денег "
+    "даже вхолостую — MILP гасит лишние юниты. 0 = не "
+    "моделировать. Работает только в MILP-режиме.":
+        "A running genset’s constant fuel draw on top of the load (the "
+        "intercept of the REopt fuel curve). It costs money even at idle — "
+        "so MILP shuts down spare units. 0 = don’t model. Works only in "
+        "MILP mode.",
+    "MILP-парк: {} генсет(ов) по {:g} kW · одновременно в работе "
+    "до {}, в среднем {} · целые машины и стадирование по часам":
+        "MILP fleet: {} genset(s) of {:g} kW · up to {} running at once, "
+        "{} on average · whole machines and hourly staging",
     "Пересчитать": "Recalculate",
     "Зафиксировать текущий как базу": "Fix current as baseline",
 

@@ -107,3 +107,89 @@ def test_unit_sizes_loaded():
     assert scenario.battery.unit_kw == 125    # PCS
     assert scenario.pv.unit_kw == 0.58        # панель 580 Вт
     assert scenario.diesel.unit_kw == 1000    # генсет
+
+
+# ---------- топливо: цена литра × расход (v1.1) ----------
+
+def test_fuel_cost_derived_from_price_per_liter():
+    """$/кВт*ч можно НЕ задавать: он выводится из цены литра и расхода
+    (как fuel_cost_per_gallon × slope в REopt). 0.96 × 0.27 = 0.2592."""
+    data = load_yemen_dict()
+    del data["diesel"]["fuel_cost_usd_per_kwh"]
+    data["diesel"]["fuel_price_usd_per_liter"] = 0.96
+    data["diesel"]["fuel_liters_per_kwh"] = 0.27
+    scenario = Scenario.model_validate(data)
+    assert scenario.diesel.fuel_cost_usd_per_kwh == pytest.approx(0.2592)
+
+
+def test_fuel_price_per_liter_needs_consumption():
+    """Цена литра без удельного расхода — недостаточно для $/кВт*ч."""
+    data = load_yemen_dict()
+    del data["diesel"]["fuel_cost_usd_per_kwh"]
+    data["diesel"]["fuel_price_usd_per_liter"] = 0.96
+    with pytest.raises(ValidationError):
+        Scenario.model_validate(data)
+
+
+def test_fuel_neither_source_rejected():
+    """Совсем без топливной цены — ошибка (нечем считать деньги)."""
+    data = load_yemen_dict()
+    del data["diesel"]["fuel_cost_usd_per_kwh"]
+    with pytest.raises(ValidationError):
+        Scenario.model_validate(data)
+
+
+def test_fuel_direct_kwh_still_works():
+    """Прямой $/кВт*ч (как у вендора) по-прежнему принимается."""
+    scenario = Scenario.model_validate(load_yemen_dict())
+    assert scenario.diesel.fuel_cost_usd_per_kwh == 0.26
+
+
+# ---------- поля MILP-режима (группа A) ----------
+
+def test_min_turn_down_fraction_read():
+    """Минимальная загрузка генсета читается из сценария (для MILP)."""
+    data = load_yemen_dict()
+    data["diesel"]["min_turn_down_fraction"] = 0.3
+    scenario = Scenario.model_validate(data)
+    assert scenario.diesel.min_turn_down_fraction == 0.3
+
+
+def test_idle_fuel_needs_price_per_liter():
+    """Холостой ход задан в литрах — без цены литра его не перевести
+    в деньги, поэтому это ошибка контракта."""
+    data = load_yemen_dict()
+    data["diesel"]["fuel_idle_liters_per_hour"] = 8.0
+    with pytest.raises(ValidationError):
+        Scenario.model_validate(data)
+
+
+def test_idle_fuel_with_price_ok():
+    """Холостой ход + цена литра — валидная пара (intercept REopt)."""
+    data = load_yemen_dict()
+    data["diesel"]["fuel_price_usd_per_liter"] = 0.96
+    data["diesel"]["fuel_idle_liters_per_hour"] = 8.0
+    scenario = Scenario.model_validate(data)
+    assert scenario.diesel.fuel_idle_liters_per_hour == 8.0
+
+
+# ---------- оперативный резерв (B1) заменил firm-capacity ----------
+
+def test_operating_reserve_fields_read():
+    """Доли оперативного резерва читаются из блока reliability."""
+    data = load_yemen_dict()
+    data["reliability"] = {"mode": "hard",
+                           "operating_reserve_load_fraction": 0.2,
+                           "operating_reserve_pv_fraction": 0.1}
+    scenario = Scenario.model_validate(data)
+    assert scenario.reliability.operating_reserve_load_fraction == 0.2
+    assert scenario.reliability.operating_reserve_pv_fraction == 0.1
+
+
+def test_old_firm_fraction_field_removed():
+    """Прежний костыль diesel_firm_fraction удалён из схемы — попытка
+    его задать теперь ловится (extra='forbid'), а не игнорируется молча."""
+    data = load_yemen_dict()
+    data["reliability"] = {"mode": "hard", "diesel_firm_fraction": 1.0}
+    with pytest.raises(ValidationError):
+        Scenario.model_validate(data)
