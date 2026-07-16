@@ -44,7 +44,7 @@
     "lifetime_years": 15
   },
   "load": {
-    "profile_csv": "scenarios\\phoenix_hospital_load.csv"
+    "profile_csv": "scenarios/phoenix_hospital_load.csv"
   },
   "financial": {
     "discount_rate_fraction": 0.08,
