@@ -612,6 +612,226 @@ TRANSLATIONS: dict[str, str] = {
     "Оптимизация не удалась: {}": "Optimization failed: {}",
     "Проблема с входными данными: {}": "Input data problem: {}",
 
+    # ---------- клиентская редакция v1.2 (без внутреннего жаргона) ----------
+    "Заполни параметры и нажми «Пересчитать» — они наложатся "
+    "на базовый сценарий, и калькулятор найдёт новый оптимум. "
+    "Единицы: kW / kWh / USD.":
+        "Set the parameters and press “Recalculate” — they overlay the base "
+        "scenario and the calculator finds a new optimum. "
+        "Units: kW / kWh / USD.",
+    "Сколько литров сжигает генсет на 1 кВт*ч на номинале "
+    "(datasheet). Типовой дизель ~0.27. Холостой ход "
+    "учитывается в режиме точного расчёта парка (ниже).":
+        "How many liters the genset burns per 1 kWh at rated load "
+        "(datasheet). A typical diesel ~0.27. Idle burn is accounted for in "
+        "the exact fleet mode (below).",
+    "hard: каждый kWh спроса покрыт. lpsp: недопоставка не выше "
+    "заданной доли. voll: модель сама решает, что дешевле — "
+    "поставить или заплатить штраф за тьму.":
+        "hard: every kWh of demand is met. lpsp: unmet load no higher than "
+        "a set fraction. voll: the model decides what is cheaper — supply "
+        "or pay the penalty for darkness.",
+    "Горячий запас мощности сверх нагрузки в КАЖДЫЙ час: "
+    "недогруженный дизель + доступный разряд батареи. Страхует "
+    "реальную работу от сюрпризов и закрывает разрыв между "
+    "идеальным планом и реальностью. 0 = выключено.":
+        "Hot power headroom above the load EVERY hour: the underloaded "
+        "diesel + the battery’s available discharge. Insures real operation "
+        "against surprises and closes the gap between the ideal plan and "
+        "reality. 0 = off.",
+    "Дополнительный резерв, привязанный к выработке солнца: "
+    "облако роняет PV — запас страхует. Панель сама резерв не "
+    "даёт (она и есть источник неопределённости).":
+        "Extra reserve tied to solar output: a cloud drops PV — the "
+        "headroom insures against it. The panel itself provides no reserve "
+        "(it is the source of uncertainty).",
+    "Точный расчёт парка (целые машины)":
+        "Exact fleet model (whole machines)",
+    "Размеры кратны юниту (целые панели/шкафы/генсеты), а "
+    "дизельный парк включается по часам — «сколько генсетов "
+    "работает сейчас» — с минимальной загрузкой и холостым "
+    "ходом. Честнее физика, но расчёт заметно дольше.":
+        "Sizes are multiples of the unit (whole panels/cabinets/gensets), "
+        "and the diesel fleet switches on by the hour — “how many gensets "
+        "run now” — with a minimum load and idle burn. More honest physics, "
+        "but the run takes noticeably longer.",
+    "Включённый генсет не опускается ниже этой доли номинала "
+    "(типично 15–30% у автономных систем). Работает только в "
+    "точном расчёте парка.":
+        "A running genset stays above this fraction of its rating "
+        "(typically 15–30% for off-grid systems). Works only in the exact "
+        "fleet mode.",
+    "Постоянный расход топлива работающего генсета сверх "
+    "нагрузки. Стоит денег даже вхолостую — модель гасит "
+    "лишние генсеты. 0 = не моделировать. Работает только в "
+    "точном расчёте парка.":
+        "A running genset’s constant fuel draw on top of the load. It costs "
+        "money even at idle — so the model shuts down spare gensets. 0 = "
+        "don’t model. Works only in the exact fleet mode.",
+    "Стрелки у метрик — сравнение с зафиксированной базой "
+    "(кнопка «Зафиксировать текущий как базу» в сайдбаре)":
+        "Metric arrows compare against the fixed baseline (the “Fix "
+        "current as baseline” button in the sidebar)",
+    "Парк генераторов: {} шт по {:g} kW · одновременно в работе "
+    "до {}, в среднем {} (точный расчёт целыми машинами)":
+        "Generator fleet: {} units of {:g} kW · up to {} running at once, "
+        "{} on average (exact whole-machine mode)",
+    "*Оценка: {} кг CO₂ на kWh дизеля · недопоставка (LPSP) = {} · "
+    "сброс излишков солнца = {} kWh":
+        "*Estimate: {} kg CO₂ per kWh of diesel · unmet load (LPSP) = {} · "
+        "curtailed solar surplus = {} kWh",
+    "Проверка надёжности": "Reliability check",
+    "Риски и цены": "Risks & prices",
+    "Кол-во и «установлено» — сколько ЦЕЛЫХ юнитов купить "
+    "(оптимум, округлённый вверх до целых юнитов); подробно "
+    "о каждой колонке — в развороте ниже.":
+        "Qty and “installed” — how many WHOLE units to buy (the optimum "
+        "rounded up to whole units); details on each column in the "
+        "expander below.",
+    "Потоки энергии за год": "Annual energy flows",
+    "Солнце": "Solar",
+    "Батарея": "Battery",
+    "Сброс излишков": "Curtailed surplus",
+    "Потери цикла": "Cycle losses",
+    "ширина каждой ленты пропорциональна энергии за год "
+    "(kWh). Видна вся дорога: сколько солнца ушло заводу "
+    "напрямую, сколько — через батарею (и что потерялось в "
+    "цикле), сколько добавил дизель и сколько излишков "
+    "пришлось сбросить.":
+        "the width of each ribbon is proportional to the year’s energy "
+        "(kWh). The whole journey is visible: how much solar went straight "
+        "to the plant, how much via the battery (and what was lost in the "
+        "cycle), how much the diesel added and how much surplus had to be "
+        "curtailed.",
+    "Калькулятор перебрал все допустимые комбинации размеров и режимов "
+    "работы за 8760 часов года и нашёл самую дешёвую, которая держит "
+    "нагрузку при выбранной политике надёжности. Таблица переводит "
+    "оптимум в целые единицы к закупке. Схема — топология AC-coupling: "
+    "все источники параллельно на одной шине 400 В.":
+        "The calculator searched every feasible combination of sizes and "
+        "operating modes across the 8760 hours of the year and found the "
+        "cheapest one that holds the load under the chosen reliability "
+        "policy. The table converts the optimum into whole purchasable "
+        "units. The diagram is the AC-coupling topology: all sources in "
+        "parallel on one 400 V bus.",
+    "Неделя 16–22 февраля: кто кормит завод":
+        "Week 16–22 Feb: who feeds the plant",
+    "Кто кормит завод по месяцам": "Who feeds the plant, month by month",
+    "сезонный разрез года: в месяцы слабого солнца красный "
+    "слой (дизель) толще. Помогает планировать завоз топлива "
+    "по сезонам.":
+        "the year in seasonal cross-section: in weak-sun months the red "
+        "layer (diesel) is thicker. Helps plan fuel deliveries by season.",
+    "Экономия против «100% дизель»": "Savings vs “100% diesel”",
+    "Сверка: сумма статей совпадает с итогом оптимизации (${}) "
+    "— две независимые дороги к одному числу.":
+        "Cross-check: the sum of line items matches the optimization total "
+        "(${}) — two independent roads to one number.",
+    "всё из дизеля (только топливо)": "all-diesel (fuel only)",
+    "гибрид (закупка + эксплуатация)": "hybrid (purchase + operation)",
+    "окупаемость": "payback",
+    "Накопленные затраты по годам проекта":
+        "Cumulative cost over the project years",
+    "год проекта": "project year",
+    "красный пунктир — если продолжать жечь только дизель; "
+    "синяя линия стартует выше (разовая закупка железа), но "
+    "растёт медленнее (солнце бесплатное). Точка пересечения — "
+    "окупаемость: дальше каждый год работает в плюс.":
+        "the dashed red line is “keep burning diesel only”; the blue line "
+        "starts higher (one-off hardware purchase) but grows slower (the "
+        "sun is free). The crossing point is payback: beyond it every year "
+        "works in your favor.",
+    "Деньги системы в одном месте: CRF превращает разовые покупки в "
+    "годовые платежи, NPC собирает все затраты горизонта в сегодняшних "
+    "деньгах, окупаемость меряется против базовой линии «вся энергия из "
+    "дизеля». У Йемена бюджет ест топливо — потому анализ на вкладке "
+    "«Риски и цены» ставит цену солярки на первое место.":
+        "The system’s money in one place: CRF turns one-off purchases into "
+        "annual payments, NPC gathers all horizon costs in today’s money, "
+        "payback is measured against the “all energy from diesel” baseline. "
+        "For Yemen fuel eats the budget — that is why the analysis on the "
+        "“Risks & prices” tab ranks the diesel price first.",
+    "План оптимизатора «знает» весь год наперёд — реальный контроллер "
+    "на площадке будущего не видит. Здесь найденные размеры проверяются "
+    "пошаговым симулятором без предвидения — разница и есть запас "
+    "прочности плана.":
+        "The optimizer’s plan “knows” the whole year ahead — a real "
+        "controller on site cannot see the future. Here the found sizes are "
+        "checked by a step-by-step simulator with no foresight — the "
+        "difference is the plan’s safety margin.",
+    "LPSP: идеальный план": "LPSP: ideal plan",
+    "LPSP: реальная работа": "LPSP: real operation",
+    "Больше нуля при политике hard — реальная работа без "
+    "предвидения иногда не дотягивает на размерах, ужатых "
+    "оптимизацией. Лечится оперативным резервом (ползунок "
+    "в сайдбаре).":
+        "Greater than zero under the hard policy — real operation without "
+        "foresight sometimes falls short on sizes squeezed by the "
+        "optimization. Cured by the operating reserve (sidebar slider).",
+    "Недопоставка в реальной работе": "Unmet load in real operation",
+    "идеальный план (видит год наперёд)":
+        "ideal plan (sees the year ahead)",
+    "реальная работа (без предвидения)":
+        "real operation (no foresight)",
+    "Годовые потоки: идеальный план против реальной работы":
+        "Annual flows: ideal plan vs real operation",
+    "пары полос сравнивают одинаковые потоки НА ОДНИХ размерах "
+    "железа. Тёмная — недостижимый идеал; светлая — "
+    "приземлённая реальность. Смотри на «недопоставку»: если в "
+    "реальной работе она больше нуля — добавь оперативный "
+    "резерв (сайдбар) или инженерный запас.":
+        "pairs of bars compare the same flows AT THE SAME hardware sizes. "
+        "Dark is the unattainable ideal; light is grounded reality. Look at "
+        "“unmet load”: if it is above zero in real operation — add an "
+        "operating reserve (sidebar) or an engineering margin.",
+    "Проверка плана на честность: найденное решение — нижняя граница "
+    "затрат. Практический смысл: к размеру дизеля стоит добавлять "
+    "инженерный запас — вендоры делают именно это.":
+        "An honesty check of the plan: the found solution is the lower "
+        "bound of cost. Practical takeaway: add an engineering margin to "
+        "the diesel size — vendors do exactly that.",
+    "Что будет с бюджетом при других ценах, почём каждая ступень "
+    "надёжности и как план переживает плохие сценарии. Запускается по "
+    "кнопке; результат сохраняется до изменения параметров.":
+        "What happens to the budget under different prices, the cost of "
+        "each step of reliability, and how the plan survives bad scenarios. "
+        "Started by a button; the result is kept until the inputs change.",
+    "Запустить анализ рисков": "Run risk analysis",
+    "Что сильнее всего влияет на бюджет":
+        "What moves the budget the most",
+    "граница возможного (дешевле при такой надёжности не бывает)":
+        "the frontier of the possible (no cheaper at this reliability)",
+    "Сколько стоит надёжность": "The cost of reliability",
+    "Входные цены — прогнозы, и надо знать, какие опасно прогнозировать "
+    "плохо, почём каждая «девятка» надёжности и как дизайн переживает "
+    "плохие сценарии — песчаную бурю и недельный топливный разрыв "
+    "(таблица стрессов: хороший дизайн деградирует на доли процента, "
+    "а не катастрофой).":
+        "Input prices are forecasts, and you need to know which are "
+        "dangerous to forecast badly, the price of each “nine” of "
+        "reliability, and how the design survives bad scenarios — a "
+        "sandstorm and a week-long fuel gap (stress table: a good design "
+        "degrades by fractions of a percent, not catastrophically).",
+    "Каждый вариант — самодостаточный пакет (входы + размеры + "
+    "метрики): JSON — для архива и передачи, HTML-отчёт — для письма "
+    "заказчику. Таблица и графики сравнения отвечают на главный "
+    "переговорный вопрос: как меняются закупка и LCOE между вариантами.":
+        "Each variant is a self-contained package (inputs + sizes + "
+        "metrics): the JSON — for archiving and hand-off, the HTML report — "
+        "for a letter to the client. The comparison table and charts answer "
+        "the main negotiation question: how procurement and LCOE change "
+        "between variants.",
+    "Сверка с внешним инструментом (REopt web / HOMER). Прогони тот же "
+    "сценарий там, впиши их числа — отклонения **> 10%** будут "
+    "помечены. Публичного API у HOMER нет, у REopt нужен ключ NREL — "
+    "поэтому сверка идёт по введённым вручную числам, честно и "
+    "прозрачно.":
+        "Cross-check with an external tool (REopt web / HOMER). Run the "
+        "same scenario there, enter their numbers — deviations **> 10%** "
+        "are flagged. HOMER has no public API, REopt needs an NREL key — so "
+        "the cross-check uses manually entered numbers, honestly and "
+        "transparently.",
+
     # ---------- обёртки-помощники ----------
     "Что здесь происходит и зачем.": "What happens here and why.",
     "Как читать:": "How to read it:",
@@ -640,8 +860,8 @@ GLOSSARY_RU = """
 - **Shortfall** — недопоставка: спрос, который не покрыл никто.
 - **VOLL** — value of lost load: цена недопоставленного kWh потребителю.
 - **Clipping** — срезка пиков DC инвертором меньшего номинала (DC/AC).
-- **Perfect foresight** — LP-солвер «знает» весь год наперёд; реальный
-  контроллер — нет, разрыв меряем во вкладке «Rule vs LP».
+- **Perfect foresight** — модель «знает» весь год наперёд; реальный
+  контроллер — нет, разрыв меряем во вкладке «Проверка надёжности».
 - **Pareto-фронт / колено** — кривая «стоимость ↔ надёжность» и точка,
   после которой уступки почти не экономят.
 - **Tornado** — чей ценовой прогноз сильнее всего качает результат.
@@ -669,8 +889,8 @@ GLOSSARY_EN = """
 - **Shortfall** — unmet load: demand nobody covered.
 - **VOLL** — value of lost load: price of an unserved kWh to the consumer.
 - **Clipping** — trimming DC peaks by a smaller-rated inverter (DC/AC).
-- **Perfect foresight** — the LP solver “knows” the whole year ahead; a
-  real controller does not — the gap is measured on the “Rule vs LP” tab.
+- **Perfect foresight** — the model “knows” the whole year ahead; a real
+  controller does not — the gap is measured on the “Reliability check” tab.
 - **Pareto front / knee** — the “cost ↔ reliability” curve and the point
   after which concessions barely save money.
 - **Tornado** — whose price forecast shakes the result the most.

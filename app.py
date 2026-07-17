@@ -134,7 +134,18 @@ def run_sizing_cached(scenario_json: str, load_csv_text: str | None,
         "load": week_df["load_kw"].tolist(),
         "soc": week_df["soc_kwh"].tolist(),
     } if len(week_df) else None
-    return res.sizes, res.units, metrics, energy_mix, week
+    # Помесячный разрез поставки (kWh за месяц по источникам) — сезонный
+    # взгляд для клиента: в месяцы слабого солнца дизельный слой толще.
+    # Только числовые колонки: в таблице есть и строковые (run_id).
+    monthly_df = (tbl[["pv_to_load_kw", "discharge_kw", "dg_kw"]]
+                  .resample("MS").sum() * m["timestep_hours"])
+    monthly = {
+        "labels": [int(ts.month) for ts in monthly_df.index],
+        "pv": monthly_df["pv_to_load_kw"].tolist(),
+        "bess": monthly_df["discharge_kw"].tolist(),
+        "dg": monthly_df["dg_kw"].tolist(),
+    } if len(monthly_df) >= 2 else None
+    return res.sizes, res.units, metrics, energy_mix, week, monthly
 
 
 @st.cache_data(show_spinner="profiles...")
@@ -164,8 +175,8 @@ def profiles_cached(scenario_json: str, load_csv_text: str | None):
 @st.cache_data(show_spinner="rule...")
 def rule_check_cached(scenario_json: str, load_csv_text: str | None,
                       sizes_json: str):
-    """Perfect-foresight проверка: LP-размеры фиксируются (min = max)
-    и прогоняются через слепой rule-симулятор шага 5."""
+    """Perfect-foresight проверка: оптимальные размеры фиксируются
+    (min = max) и прогоняются через слепой rule-симулятор без предвидения."""
     data = _apply_load(json.loads(scenario_json), load_csv_text)
     sizes = json.loads(sizes_json)
     if data.get("pv"):
@@ -247,6 +258,10 @@ def econ_breakdown(data: dict, sizes: dict, metrics: dict) -> dict:
         "capex_total": capex_total,
         "npc": annual / capital_recovery_factor(rate, years),
         "baseline": baseline,
+        # Живые деньги года (без CRF-аннуитета) — для кривой накопленных
+        # затрат: закупка платится один раз, дальше только O&M + топливо.
+        "opex": om_total + metrics["fuel_usd"],
+        "savings": savings,
         "payback": capex_total / savings if savings > 0 else None,
     }
 
@@ -381,8 +396,8 @@ def T2(s):
 
 st.sidebar.caption(T(
     "Заполни параметры и нажми «Пересчитать» — они наложатся "
-    "на базовый сценарий (паттерн Calliope: base + overrides) "
-    "и уйдут в LP-оптимизатор. Единицы: kW / kWh / USD."))
+    "на базовый сценарий, и калькулятор найдёт новый оптимум. "
+    "Единицы: kW / kWh / USD."))
 
 with open(BASE_SCENARIO, encoding="utf-8") as f:
     base = json.load(f)
@@ -439,8 +454,7 @@ with st.sidebar.form("params"):
         T("Удельный расход, л/кВт*ч"), 0.20, 0.40, 0.27, 0.01,
         help=T("Сколько литров сжигает генсет на 1 кВт*ч на номинале "
                "(datasheet). Типовой дизель ~0.27. Холостой ход "
-               "(intercept топливной кривой) v1 не моделирует — он "
-               "требует MILP."))
+               "учитывается в режиме точного расчёта парка (ниже)."))
     st.caption(T("→ эффективно ${}/кВт*ч дизеля").format(
         f"{fuel_price_l * fuel_l_per_kwh:.3f}"))
 
@@ -496,7 +510,7 @@ with st.sidebar.form("params"):
             "lpsp": T("lpsp — допустимая доля недопоставки"),
             "voll": T("voll — недопоставка платная")}[k],
         help=T("hard: каждый kWh спроса покрыт. lpsp: недопоставка не выше "
-               "заданной доли. voll: солвер сам решает, что дешевле — "
+               "заданной доли. voll: модель сама решает, что дешевле — "
                "поставить или заплатить штраф за тьму."))
     lpsp_max_pct = st.slider(
         T("LPSP-цель, % (для режима lpsp)"), 0.1, 10.0, 1.0, 0.1,
@@ -508,15 +522,14 @@ with st.sidebar.form("params"):
                "потребителя (простой производства). Дефолт REopt: $1."))
     reserve_load_pct = st.slider(
         T("Оперативный резерв, % нагрузки"), 0, 50, 0, 5,
-        help=T("Горячий запас мощности сверх нагрузки в КАЖДЫЙ час "
-               "(REopt operating reserve): недогруженный дизель + "
-               "доступный разряд батареи. Принципиальная замена костылю "
-               "«дизель на весь пик»: закрывает разрыв LP-предвидения и "
-               "слепого контроллера. 0 = выключено."))
+        help=T("Горячий запас мощности сверх нагрузки в КАЖДЫЙ час: "
+               "недогруженный дизель + доступный разряд батареи. Страхует "
+               "реальную работу от сюрпризов и закрывает разрыв между "
+               "идеальным планом и реальностью. 0 = выключено."))
     reserve_pv_pct = st.slider(
         T("Резерв на PV, %"), 0, 50, 0, 5,
         help=T("Дополнительный резерв, привязанный к выработке солнца: "
-               "облако роняет PV — запас страхует. Panель сама резерв не "
+               "облако роняет PV — запас страхует. Панель сама резерв не "
                "даёт (она и есть источник неопределённости)."))
     cyclic = st.checkbox(
         T("Циклический SOC (годовое кольцо)"), value=True,
@@ -524,25 +537,24 @@ with st.sidebar.form("params"):
                "(паттерн Calliope) — без бесплатной стартовой заправки. "
                "Выключи для сравнения с REopt-стилем (старт с полной)."))
 
-    st.subheader(T("Точный расчёт парка (MILP)"))
+    st.subheader(T("Точный расчёт парка (целые машины)"))
     milp_on = st.checkbox(
         T("Целые машины + стадирование дизеля (медленнее)"), value=False,
-        help=T("Вместо непрерывного LP решить MILP: размеры кратны юниту "
-               "(целые панели/шкафы/генсеты), а дизель стадируется по "
-               "часам — «сколько генсетов молотит сейчас» — с минимальной "
-               "загрузкой и расходом на холостой ход. Честнее физика, но "
-               "solver ветвит и считает десятки секунд вместо секунд."))
+        help=T("Размеры кратны юниту (целые панели/шкафы/генсеты), а "
+               "дизельный парк включается по часам — «сколько генсетов "
+               "работает сейчас» — с минимальной загрузкой и холостым "
+               "ходом. Честнее физика, но расчёт заметно дольше."))
     turndown_pct = st.slider(
         T("Мин. загрузка генсета, %"), 0, 60, 30, 5,
         help=T("Включённый генсет не опускается ниже этой доли номинала "
-               "(REopt min_turn_down_fraction, дефолт off-grid 15–30%). "
-               "Работает только в MILP-режиме."))
+               "(типично 15–30% у автономных систем). Работает только в "
+               "точном расчёте парка."))
     idle_lph = st.slider(
         T("Холостой ход, л/ч на генсет"), 0.0, 30.0, 0.0, 1.0,
         help=T("Постоянный расход топлива работающего генсета сверх "
-               "нагрузки (intercept топливной кривой REopt). Стоит денег "
-               "даже вхолостую — MILP гасит лишние юниты. 0 = не "
-               "моделировать. Работает только в MILP-режиме."))
+               "нагрузки. Стоит денег даже вхолостую — модель гасит "
+               "лишние генсеты. 0 = не моделировать. Работает только в "
+               "точном расчёте парка."))
 
     submitted = st.form_submit_button(T("Пересчитать"), type="primary",
                                       width="stretch")
@@ -601,7 +613,7 @@ scenario_json = json.dumps(data, sort_keys=True)
 # ============================ запуск ядра ============================
 
 try:
-    sizes, units, metrics, energy_mix, week = run_sizing_cached(
+    sizes, units, metrics, energy_mix, week, monthly = run_sizing_cached(
         scenario_json, load_csv_text, cyclic, milp_on)
 except RuntimeError as e:
     st.error(T("Оптимизация не удалась: {}").format(e))
@@ -617,12 +629,12 @@ base_sizes, base_metrics = st.session_state.baseline
 # ============================ метрики ============================
 
 st.title(T("Оптимальная конфигурация"))
-st.caption(T("Решено за {} c · дельты — против зафиксированной базы "
-             "(кнопка в сайдбаре)").format(metrics["solve_seconds"]))
+st.caption(T("Стрелки у метрик — сравнение с зафиксированной базой "
+             "(кнопка «Зафиксировать текущий как базу» в сайдбаре)"))
 if metrics.get("staging"):
     s = metrics["staging"]
-    st.caption(T("MILP-парк: {} генсет(ов) по {:g} kW · одновременно в работе "
-                 "до {}, в среднем {} · целые машины и стадирование по часам")
+    st.caption(T("Парк генераторов: {} шт по {:g} kW · одновременно в работе "
+                 "до {}, в среднем {} (точный расчёт целыми машинами)")
                .format(s["dg_units_installed"], s["dg_unit_kw"],
                        s["dg_units_on_max"], s["dg_units_on_mean"]))
 
@@ -647,14 +659,16 @@ c4.metric(T("Дизель"), f"{metrics['dg_kwh']:,.0f} kWh",
 c5.metric(T("CO₂ (оценка*)"), f"{metrics['co2_tons']:,.0f} t/yr",
           delta(metrics["co2_tons"], base_metrics["co2_tons"]),
           delta_color="inverse")
-st.caption(T("*ASSUMPTION {} кг CO₂/kWh дизеля · LPSP = {} · curtailment = {} "
-             "kWh").format(CO2_KG_PER_DIESEL_KWH, f"{metrics['lpsp']:.2%}",
-                          f"{metrics['curtail_kwh']:,.0f}"))
+st.caption(T("*Оценка: {} кг CO₂ на kWh дизеля · недопоставка (LPSP) = {} · "
+             "сброс излишков солнца = {} kWh")
+           .format(CO2_KG_PER_DIESEL_KWH, f"{metrics['lpsp']:.2%}",
+                   f"{metrics['curtail_kwh']:,.0f}"))
 
 (tab_cfg, tab_disp, tab_res, tab_eco, tab_rule,
  tab_sens, tab_scen, tab_valid) = st.tabs(
     [T("Конфигурация"), T("Диспетчеризация"), T("Ресурсы"), T("Экономика"),
-     "Rule vs LP", "Sensitivity", T("Сценарии"), T("Валидация")]
+     T("Проверка надёжности"), T("Риски и цены"), T("Сценарии"),
+     T("Валидация")]
 )
 
 # ---------- конфигурация ----------
@@ -687,8 +701,8 @@ with tab_cfg:
     })
     st.dataframe(pd.DataFrame(_spec_rows), hide_index=True, width="stretch")
     st.caption(T("Кол-во и «установлено» — сколько ЦЕЛЫХ юнитов купить "
-                 "(ceil от LP-оптимума); подробно о каждой колонке — в "
-                 "развороте ниже."))
+                 "(оптимум, округлённый вверх до целых юнитов); подробно "
+                 "о каждой колонке — в развороте ниже."))
     with st.expander(T("Что означает каждая колонка")):
         st.markdown(COLUMNS_HELP_EN if lang == "EN" else COLUMNS_HELP_RU)
 
@@ -729,6 +743,46 @@ with tab_cfg:
                     "Красный сектор растёт — система дрейфует от «солнце с "
                     "резервом» к «дизель с довеском».")
 
+    # Sankey годового потока энергии — фирменный клиентский визуал
+    # HOMER/REopt-отчётов: ширина ленты = энергия за год, видна вся дорога
+    # от источника до завода, включая потери и сброс.
+    pv_direct_y = energy_mix.get("Солнце напрямую", 0.0)
+    via_batt_y = energy_mix.get("Солнце через батарею", 0.0)
+    dg_year_y = energy_mix.get("Дизель", 0.0)
+    curtail_y = metrics["curtail_kwh"]
+    charge_y = max(metrics["pv_gen_kwh"] - pv_direct_y - curtail_y, 0.0)
+    loss_y = max(charge_y - via_batt_y, 0.0)
+    sankey_links = [
+        (0, 3, pv_direct_y, "rgba(237,161,0,0.55)"),
+        (0, 2, charge_y, "rgba(237,161,0,0.35)"),
+        (0, 4, curtail_y, "rgba(160,160,160,0.45)"),
+        (2, 3, via_batt_y, "rgba(27,175,122,0.55)"),
+        (2, 5, loss_y, "rgba(160,160,160,0.45)"),
+        (1, 3, dg_year_y, "rgba(227,73,72,0.55)"),
+    ]
+    sankey_links = [l for l in sankey_links if l[2] > 1e-6]
+    if sankey_links:
+        st.subheader(T("Потоки энергии за год"))
+        fig_sk = go.Figure(go.Sankey(
+            node=dict(
+                label=[T("Солнце"), T("Дизель-генератор"), T("Батарея"),
+                       T("Завод (нагрузка)"), T("Сброс излишков"),
+                       T("Потери цикла")],
+                pad=18, thickness=16,
+                color=[C_PV, C_DG, C_BESS, "#555", "#999", "#999"]),
+            link=dict(source=[l[0] for l in sankey_links],
+                      target=[l[1] for l in sankey_links],
+                      value=[round(l[2]) for l in sankey_links],
+                      color=[l[3] for l in sankey_links]),
+        ))
+        fig_sk.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig_sk, width="stretch")
+        legend_help("ширина каждой ленты пропорциональна энергии за год "
+                    "(kWh). Видна вся дорога: сколько солнца ушло заводу "
+                    "напрямую, сколько — через батарею (и что потерялось в "
+                    "цикле), сколько добавил дизель и сколько излишков "
+                    "пришлось сбросить.")
+
     st.subheader(T("Схема системы (AC-coupling, шина 400 В)"))
     fig_sch = go.Figure()
     boxes = [
@@ -762,13 +816,11 @@ with tab_cfg:
     st.plotly_chart(fig_sch, width="stretch")
 
     tab_footer(
-        "LP-оптимизатор перебрал все допустимые комбинации размеров и режимов "
+        "Калькулятор перебрал все допустимые комбинации размеров и режимов "
         "работы за 8760 часов года и нашёл самую дешёвую, которая держит "
-        "нагрузку при выбранной политике надёжности. Размеры он ищет "
-        "непрерывными (так задача решается за секунды с гарантией оптимума), "
-        "а таблица переводит их в целые штуки: ceil(размер / юнит). "
-        "Схема — топология AC-coupling: все источники параллельно на одной "
-        "шине 400 В, как в вендорском предложении."
+        "нагрузку при выбранной политике надёжности. Таблица переводит "
+        "оптимум в целые единицы к закупке. Схема — топология AC-coupling: "
+        "все источники параллельно на одной шине 400 В."
     )
 
 # ---------- диспетчеризация ----------
@@ -788,7 +840,7 @@ with tab_disp:
         fig_w.add_scatter(x=x, y=week["load"], name=T("нагрузка завода (спрос)"),
                           line=dict(color="#111", dash="dash", width=1.5))
         fig_w.update_layout(
-            title=T("Неделя 16–22 февраля: кто кормит завод (LP-решение)"),
+            title=T("Неделя 16–22 февраля: кто кормит завод"),
             xaxis_title=T("часы недели"), yaxis_title="kW", height=380,
             legend=dict(orientation="h", y=1.14),
         )
@@ -818,6 +870,25 @@ with tab_disp:
                     "границы: ниже красной не разряжаем (ресурс ячеек), выше "
                     "серой физически некуда. Линия редко касается потолка — "
                     "батарея великовата; бьётся об пол каждую ночь — мала.")
+
+    # Сезонный разрез: поставка по месяцам (стек по источникам) — стандарт
+    # клиентских отчётов HOMER («monthly electric production»).
+    if monthly is not None:
+        fig_mm = go.Figure()
+        for key, name_ru, color in (
+                ("pv", "солнце → завод (напрямую)", C_PV),
+                ("bess", "батарея → завод (разряд запаса)", C_BESS),
+                ("dg", "дизель → завод (резерв)", C_DG)):
+            fig_mm.add_bar(x=monthly["labels"], y=monthly[key],
+                           name=T(name_ru), marker_color=color)
+        fig_mm.update_layout(barmode="stack",
+                             title=T("Кто кормит завод по месяцам"),
+                             xaxis_title=T("месяц"), yaxis_title="kWh",
+                             height=340, legend=dict(orientation="h", y=1.14))
+        st.plotly_chart(fig_mm, width="stretch")
+        legend_help("сезонный разрез года: в месяцы слабого солнца красный "
+                    "слой (дизель) толще. Помогает планировать завоз топлива "
+                    "по сезонам.")
 
     tab_footer(
         "Это «рентген» найденного решения на характерной неделе февраля. "
@@ -888,11 +959,13 @@ with tab_res:
 
 with tab_eco:
     eco = econ_breakdown(data, sizes, metrics)
-    e1, e2, e3, e4 = st.columns(4)
+    e1, e2, e3, e4, e5 = st.columns(5)
     e1.metric(T("CAPEX (разово)"), f"${eco['capex_total']:,.0f}")
     e2.metric(T("NPC (за горизонт)"), f"${eco['npc']:,.0f}")
     e3.metric(T("База «100% дизель»"), f"${eco['baseline']:,.0f}/yr")
-    e4.metric(T("Окупаемость"),
+    e4.metric(T("Экономия против «100% дизель»"),
+              f"${eco['savings']:,.0f}/yr")
+    e5.metric(T("Окупаемость"),
               T("{} лет").format(f"{eco['payback']:.1f}") if eco["payback"]
               else T("нет"))
 
@@ -913,37 +986,61 @@ with tab_eco:
                 "железа, тёмно-красный — солярка. «Капитал X» — это CAPEX, "
                 "размазанный формулой CRF в равные годовые платежи по сроку "
                 "жизни технологии.")
-    st.caption(T("Сверка: сумма статей совпадает с целевой функцией солвера "
-                 "(${}) с точностью до "
-                 "анти-вырожденного микроштрафа — две независимые дороги к "
-                 "одному числу.").format(f"{metrics['annual_cost_usd']:,.0f}"))
+    st.caption(T("Сверка: сумма статей совпадает с итогом оптимизации (${}) "
+                 "— две независимые дороги к одному числу.")
+               .format(f"{metrics['annual_cost_usd']:,.0f}"))
+
+    # Кривая накопленных затрат — главный переговорный график: где линия
+    # гибрида пересекает линию «жечь только дизель», там и окупаемость.
+    years_ax = list(range(0, int(data["financial"]["project_years"]) + 1))
+    fig_cf = go.Figure()
+    fig_cf.add_scatter(x=years_ax, y=[eco["baseline"] * y for y in years_ax],
+                       name=T("всё из дизеля (только топливо)"),
+                       line=dict(color=C_DG, width=2, dash="dash"))
+    fig_cf.add_scatter(x=years_ax,
+                       y=[eco["capex_total"] + eco["opex"] * y
+                          for y in years_ax],
+                       name=T("гибрид (закупка + эксплуатация)"),
+                       line=dict(color=C_BLUE, width=2))
+    if eco["payback"] and eco["payback"] <= years_ax[-1]:
+        fig_cf.add_vline(x=eco["payback"], line_dash="dot", line_color="#555",
+                         annotation_text=T("окупаемость"))
+    fig_cf.update_layout(title=T("Накопленные затраты по годам проекта"),
+                         xaxis_title=T("год проекта"), yaxis_title="$",
+                         height=340, legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig_cf, width="stretch")
+    legend_help("красный пунктир — если продолжать жечь только дизель; "
+                "синяя линия стартует выше (разовая закупка железа), но "
+                "растёт медленнее (солнце бесплатное). Точка пересечения — "
+                "окупаемость: дальше каждый год работает в плюс.")
 
     tab_footer(
         "Деньги системы в одном месте: CRF превращает разовые покупки в "
         "годовые платежи, NPC собирает все затраты горизонта в сегодняшних "
         "деньгах, окупаемость меряется против базовой линии «вся энергия из "
-        "дизеля». У Йемена бюджет ест топливо — потому tornado на вкладке "
-        "Sensitivity ставит цену солярки на первое место."
+        "дизеля». У Йемена бюджет ест топливо — потому анализ на вкладке "
+        "«Риски и цены» ставит цену солярки на первое место."
     )
 
 # ---------- rule vs LP ----------
 
 with tab_rule:
     st.markdown(T(
-        "LP-сайзер обладает **perfect foresight** — «знает» весь год наперёд. "
-        "Реальный контроллер работает по правилу и будущего не видит. Здесь "
-        "оптимальные размеры фиксируются и прогоняются через слепой "
-        "rule-симулятор шага 5 — разница и есть цена идеального предвидения."))
+        "План оптимизатора «знает» весь год наперёд — реальный контроллер "
+        "на площадке будущего не видит. Здесь найденные размеры проверяются "
+        "пошаговым симулятором без предвидения — разница и есть запас "
+        "прочности плана."))
     rule_totals, rule_lpsp = rule_check_cached(
         scenario_json, load_csv_text, json.dumps(sizes, sort_keys=True))
 
     r1, r2, r3 = st.columns(3)
-    r1.metric(T("LPSP у LP (всевидящий)"), f"{metrics['lpsp']:.2%}")
-    r2.metric(T("LPSP у правила (слепой)"), f"{rule_lpsp:.2%}",
-              help=T("Больше нуля при hard-политике — это и есть "
-                     "perfect-foresight разрыв: живой диспетчер иногда не "
-                     "дотягивает на размерах, ужатых оптимизатором."))
-    r3.metric(T("Недопоставка правила"),
+    r1.metric(T("LPSP: идеальный план"), f"{metrics['lpsp']:.2%}")
+    r2.metric(T("LPSP: реальная работа"), f"{rule_lpsp:.2%}",
+              help=T("Больше нуля при политике hard — реальная работа без "
+                     "предвидения иногда не дотягивает на размерах, ужатых "
+                     "оптимизацией. Лечится оперативным резервом (ползунок "
+                     "в сайдбаре)."))
+    r3.metric(T("Недопоставка в реальной работе"),
               f"{rule_totals['shortfall']:,.0f} kWh")
 
     flows = ["dg", "discharge", "curtail", "shortfall"]
@@ -955,25 +1052,25 @@ with tab_rule:
     fig_r = go.Figure()
     fig_r.add_bar(y=[T(flow_names[f]) for f in flows],
                   x=[lp_totals[f] for f in flows],
-                  name=T("LP-оптимизатор (видит год наперёд)"),
+                  name=T("идеальный план (видит год наперёд)"),
                   orientation="h", marker_color=C_BLUE)
     fig_r.add_bar(y=[T(flow_names[f]) for f in flows],
                   x=[rule_totals[f] for f in flows],
-                  name=T("правило (слепой контроллер)"),
+                  name=T("реальная работа (без предвидения)"),
                   orientation="h", marker_color=C_BLUE_LIGHT)
     fig_r.update_layout(
-        title=T("Годовые потоки: LP против правила на одних размерах"),
+        title=T("Годовые потоки: идеальный план против реальной работы"),
         xaxis_title=T("kWh за год"), height=340, barmode="group")
     st.plotly_chart(fig_r, width="stretch")
-    legend_help("пары полос сравнивают одинаковые потоки у двух диспетчеров "
-                "НА ОДНИХ размерах железа. Тёмная (LP) — недостижимый идеал; "
-                "светлая (правило) — приземлённая реальность. Смотри на "
-                "«недопоставку»: если у правила она больше нуля — это цена "
-                "отсутствия дара предвидения.")
+    legend_help("пары полос сравнивают одинаковые потоки НА ОДНИХ размерах "
+                "железа. Тёмная — недостижимый идеал; светлая — "
+                "приземлённая реальность. Смотри на «недопоставку»: если в "
+                "реальной работе она больше нуля — добавь оперативный "
+                "резерв (сайдбар) или инженерный запас.")
 
     tab_footer(
-        "Проверка на честность оптимизатора: LP-решение — нижняя граница "
-        "затрат. Практический смысл: к LP-размерам дизеля стоит добавлять "
+        "Проверка плана на честность: найденное решение — нижняя граница "
+        "затрат. Практический смысл: к размеру дизеля стоит добавлять "
         "инженерный запас — вендоры делают именно это."
     )
 
@@ -981,10 +1078,10 @@ with tab_rule:
 
 with tab_sens:
     st.markdown(T(
-        "Свипы цен (tornado), Pareto-фронт "
-        "«стоимость ↔ надёжность» с коленом, стрессы. **~2 минуты** "
-        "(≈20 LP-задач) — запускается по кнопке, результат кэшируется."))
-    if st.button(T("Запустить sensitivity (~2 мин)")) or \
+        "Что будет с бюджетом при других ценах, почём каждая ступень "
+        "надёжности и как план переживает плохие сценарии. Запускается по "
+        "кнопке; результат сохраняется до изменения параметров."))
+    if st.button(T("Запустить анализ рисков")) or \
             "sens_done" in st.session_state:
         st.session_state["sens_done"] = True
         fuel_df, bess_df, pv_df, pareto, knee, stress = sensitivity_cached(
@@ -1015,7 +1112,7 @@ with tab_sens:
                           showlegend=(name_ru == rows[0][0]))
         fig_t.add_vline(x=base_cost, line_dash="dash", line_color="#111")
         fig_t.update_layout(
-            title=T("Tornado: чувствительность издержек к ценам"),
+            title=T("Что сильнее всего влияет на бюджет"),
             xaxis_title="$/yr", height=330, barmode="overlay",
             legend=dict(orientation="h", y=-0.35))
         st.plotly_chart(fig_t, width="stretch")
@@ -1029,15 +1126,15 @@ with tab_sens:
         fig_p.add_scatter(x=pareto_sorted.lpsp_target * 100,
                           y=pareto_sorted.annual_cost_usd,
                           mode="lines+markers",
-                          name=T("Pareto-фронт (дешевле при такой надёжности "
-                                 "не бывает)"),
+                          name=T("граница возможного (дешевле при такой "
+                                 "надёжности не бывает)"),
                           line=dict(color=C_BLUE, width=2))
         fig_p.add_scatter(x=[knee["lpsp"] * 100], y=[knee["annual_cost_usd"]],
                           mode="markers",
                           name=T("колено — разумный компромисс"),
                           marker=dict(size=16, symbol="circle-open",
                                       color=C_DG, line=dict(width=3)))
-        fig_p.update_layout(title=T("Pareto: сколько стоит надёжность"),
+        fig_p.update_layout(title=T("Сколько стоит надёжность"),
                             xaxis_title=T("допустимая недопоставка (LPSP), %"),
                             yaxis_title="$/yr", height=360,
                             legend=dict(orientation="h", y=-0.3))
@@ -1053,10 +1150,10 @@ with tab_sens:
 
     tab_footer(
         "Входные цены — прогнозы, и надо знать, какие опасно прогнозировать "
-        "плохо (tornado), почём каждая «девятка» надёжности (Pareto) и как "
-        "дизайн переживает плохие сценарии — песчаную бурю и недельный "
-        "топливный разрыв (таблица стрессов: хороший дизайн деградирует на "
-        "доли процента, а не катастрофой)."
+        "плохо, почём каждая «девятка» надёжности и как дизайн переживает "
+        "плохие сценарии — песчаную бурю и недельный топливный разрыв "
+        "(таблица стрессов: хороший дизайн деградирует на доли процента, "
+        "а не катастрофой)."
     )
 
 # ---------- сценарии ----------
@@ -1064,7 +1161,8 @@ with tab_sens:
 with tab_scen:
     st.subheader(T("Отчёт и сохранение"))
     eco_now = econ_breakdown(data, sizes, metrics)
-    report_figs = [fig_cap, fig_pie]
+    # Отчёт для клиента: размеры, энергобаланс, окупаемость и типовая неделя.
+    report_figs = [fig_cap, fig_pie, fig_cf]
     if week is not None:
         report_figs.append(fig_w)
     html_report = build_html_report(data, sizes, units, metrics, energy_mix,
@@ -1143,12 +1241,10 @@ with tab_scen:
                     "передвигают и размеры закупки, и цену киловатт-часа.")
 
     tab_footer(
-        "Управление вариантами по паттерну Calliope «сценарий = база + "
-        "переопределения». Скачанный JSON — самодостаточный пакет (входы + "
-        "размеры + метрики) для письма или git; HTML-отчёт — то же для "
-        "людей без Streamlit. Таблица и графики сравнения отвечают на "
-        "главный переговорный вопрос: как меняются закупка и LCOE между "
-        "вариантами."
+        "Каждый вариант — самодостаточный пакет (входы + размеры + "
+        "метрики): JSON — для архива и передачи, HTML-отчёт — для письма "
+        "заказчику. Таблица и графики сравнения отвечают на главный "
+        "переговорный вопрос: как меняются закупка и LCOE между вариантами."
     )
 
 # ---------- валидация ----------
@@ -1158,7 +1254,8 @@ with tab_valid:
         "Сверка с внешним инструментом (REopt web / HOMER). Прогони тот же "
         "сценарий там, впиши их числа — отклонения **> 10%** будут "
         "помечены. Публичного API у HOMER нет, у REopt нужен ключ NREL — "
-        "поэтому v1 сверяет вручную введённые числа, честно и прозрачно."))
+        "поэтому сверка идёт по введённым вручную числам, честно и "
+        "прозрачно."))
     cc = st.columns(4)
     ref = {
         "PV, kWp": cc[0].number_input(T("PV референса, kWp"), value=0.0),
