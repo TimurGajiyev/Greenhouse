@@ -1,0 +1,133 @@
+[tool.pytest.ini_options]
+minversion = "6.0"
+# opts:
+# `--dist=loadscope ` - run tests within classes in series
+# `--strict-markers` - Raise error on unexpected pytest markers being used (add new markers to `markers` config)
+# `-nauto` - parallelise over as many threads as possible (uses pytest-xdist). If debugging (`--pdb`), this will default to one thread.
+# `--cov-report=xml --cov-config=pyproject.toml` - coverage report config for when running in tests (uses pytest-cov; call `--cov` in CLI to switch coverage on; `--cov-config` include to avoid bug)
+addopts = "-rav --dist=loadscope --strict-markers -nauto --cov-report=xml --cov-config=pyproject.toml -m 'not needs_gurobi_license' --pdbcls=IPython.terminal.debugger:Pdb "
+
+testpaths = ["tests"]
+
+# to mark a test, decorate it with `@pytest.mark.[marker-name]`
+markers = ["serial", "time_intensive", "needs_gurobi_license"]
+filterwarnings = [
+  # https://github.com/pytest-dev/pytest-xdist/issues/825
+  "ignore:The --rsyncdir command line argument and rsyncdirs config variable are deprecated.:DeprecationWarning",
+  "ignore:(?s).*datetime.datetime.utcfromtimestamp():",
+  "ignore:(?s).*Pyarrow will become a required dependency of pandas:DeprecationWarning",
+  "ignore:.*The return type of `Dataset.dims` will be changed to return a set of dimension names.*:FutureWarning",
+  "ignore:.*Mismatched null-like values None and nan found.*:FutureWarning"
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/"]
+
+[tool.coverage.html]
+directory = "reports/coverage"
+
+[tool.coverage.xml]
+output = "reports/coverage/coverage.xml"
+
+[tool.coverage.report]
+exclude_lines = ["if TYPE_CHECKING:", "if importlib.util.find_spec('gurobipy')"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.format]
+exclude = [".*.egg-info", "requirements/**"]
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "Q", "W", "D", "PT", "UP"]
+# line too long; Black will handle these
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.lint.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+# Ignore `E402` (import violations) and `F401` (unused imports) in all `__init__.py` files
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "D104"]
+"*.ipynb" = ["E402"]
+"tests/*" = ["D"]
+"docs/examples/*" = ["D"]
+
+[tool.ruff.lint.flake8-quotes]
+docstring-quotes = "double"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 200
+ignore-overlong-task-comments = true
+
+[tool.codespell]
+skip = 'tests/*.py,AUTHORS'
+count = ''
+quiet-level = 3
+ignore-words-list = "socio-economic"  # British english spelling that isn't covered by the inbuilt dictionary
+
+[tool.mypy]
+ignore_missing_imports = true
+files = "src/"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["calliope*"]
+
+[tool.setuptools.package-data]
+calliope = ["config/*", "math/*", "example_models/**/*", "py.typed"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "CITATION"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calliope"
+authors = [
+  { name = "Calliope contributors listed in AUTHORS", email = "stefan@pfenninger.org" },
+]
+maintainers = [
+  { name = "Stefan Pfenninger", email = "stefan@pfenninger.org" },
+  { name = "Bryn Pickering", email = "17178478+brynpickering@users.noreply.github.com" },
+]
+description = "A multi-scale energy systems modelling framework."
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["energy systems", "optimisation", "mathematical programming"]
+license = { text = "Apache 2.0" }
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+dynamic = ["version", "dependencies", "optional-dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements/base.txt"] }
+version = { attr = "calliope._version.__version__" }
+
+[project.scripts]
+calliope = "calliope.cli:cli"
+
+[tool.setuptools.dynamic.optional-dependencies]
+dev = { file = ["requirements/dev.txt"] }
+
+[project.urls]
+website = "https://www.callio.pe/"
+repository = "https://github.com/calliope-project/calliope"
+documentation = "https://calliope.readthedocs.io"
+changelog = "https://github.com/calliope-project/calliope/changelog.rst"

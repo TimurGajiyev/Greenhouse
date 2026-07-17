@@ -1,0 +1,180 @@
+site_name: Calliope
+# FIXME: `en/latest` should be changed to `en/stable` once there is a stable mkdocs based release
+site_url: https://calliope.readthedocs.io/en/latest/
+copyright: Copyright &copy; since 2013 <a href="https://github.com/calliope-project/calliope/blob/main/AUTHORS">Calliope contributors</a> (Apache 2.0 licensed)
+repo_url: https://github.com/calliope-project/calliope
+hooks:
+  - docs/hooks/changelog_highlight.py
+  - docs/hooks/generate_math_examples.py
+  - docs/hooks/generate_readable_schema.py
+  - docs/hooks/generate_math_docs.py
+  - docs/hooks/generate_plots.py
+  - docs/hooks/add_notebooks.py
+  - docs/hooks/clean_search.py
+extra:
+  min_python_version: "3.10"
+  max_python_version: "3.12"
+  calliope_version: !!python/name:calliope._version.__version__
+theme:
+  font:
+    text: Lato
+    code: Source Code Pro
+  name: material
+  custom_dir: docs/overrides
+  features:
+    - navigation.indexes
+    - navigation.top
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+    - search.share
+  logo: img/logo-bw.png
+  favicon: img/favicon.ico
+extra_css:
+  - css/extra.css
+plugins:
+  - search
+  - autorefs
+  - macros:
+      module_name: docs/hooks/macros
+  - mkdocs-jupyter:
+      enabled: !ENV [FULL_BUILD, true]
+      include: ["examples/**/*.py", "examples/*.py"]
+      ignore: ["examples/.*/*.py"]
+      allow_errors: false
+      kernel_name: calliope_docs_build
+      include_source: True
+      execute: true
+      include_requirejs: true
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            show_bases: true
+            filters:
+              - "!^_"
+            heading_level: 1
+            show_root_heading: true
+            merge_init_into_class: true
+            show_if_no_docstring: true
+            signature_crossrefs: true
+            show_root_toc_entry: false
+            show_signature_annotations: false
+            inherited_members: true
+          paths: [src]
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://pandas.pydata.org/docs/objects.inv
+            - https://docs.xarray.dev/en/stable/objects.inv
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - mkdocs-click
+  - def_list
+  - tables
+  - toc:
+      permalink: "¶"
+      toc_depth: 3
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      preserve_tabs: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets:
+      dedent_subsections: true
+  - pymdownx.details
+  - pymdownx.tasklist:
+      clickable_checkbox: true
+
+nav:
+  - Home:
+      - index.md
+      - migrating.md
+      - Contributing: contributing.md
+      - Version history: version_history.md
+  - Getting started:
+      - Download and installation: installation.md
+      - Basic concepts: getting_started/concepts.md
+      - Creating a model: getting_started/creating.md
+      - Running a model: getting_started/running.md
+      - Analysing a model: getting_started/analysing.md
+  - Examples & tutorials:
+      - examples/index.md
+      - Math gallery:
+          - user_defined_math/examples/index.md
+      - National scale example model:
+          - examples/national_scale/index.md
+          - examples/national_scale/notebook.py
+      - Urban scale example model:
+          - examples/urban_scale/index.md
+          - examples/urban_scale/notebook.py
+      - MILP example model:
+          - examples/milp/index.md
+          - examples/milp/notebook.py
+      - examples/loading_tabular_data.py
+      - examples/modes.py
+      - examples/piecewise_constraints.py
+      - examples/calliope_model_object.py
+      - examples/calliope_logging.py
+  - Building blocks:
+      - basic/index.md
+      - Model configuration: basic/config.md
+      - Modes: basic/modes.md
+      - Technologies: basic/techs.md
+      - Nodes: basic/nodes.md
+      - Data tables: basic/data_tables.md
+      - Data definitions: basic/data_definitions.md
+      - Scenarios and overrides: basic/scenarios.md
+      - Running in the command line: basic/running-cli.md
+      - Running in Python: basic/running-python.md
+      - Postprocessing: basic/postprocessing.md
+      - User-defined math:
+          - user_defined_math/index.md
+          - user_defined_math/components.md
+          - user_defined_math/syntax.md
+          - user_defined_math/helper_functions.md
+          - user_defined_math/customise.md
+  - How to:
+      - advanced/index.md
+      - Troubleshoot: troubleshooting.md
+      - advanced/constraints.md
+      - advanced/time.md
+      - advanced/scripts.md
+      - advanced/solver.md
+      - advanced/backend_choice.md
+      - advanced/backend_interface.md
+      - advanced/shadow_prices.md
+  - Reference:
+      - reference/index.md
+      - YAML as used in Calliope: reference/yaml.md
+      - Command line interface: reference/cli.md
+      - Built-in base math: math/base/index.md
+      - Other built-in math: # TODO add landing page
+          - math/built_in/index.md
+      - Python API: # TODO add landing page
+          - reference/api/model.md
+          - reference/api/backend_model.md
+          - reference/api/helper_functions.md
+          - reference/api/example_models.md
+          - reference/api/attrdict.md
+          - reference/api/exceptions.md
+          - reference/api/logging.md
+      - Schemas:
+          - reference/config_schema.md
+          - reference/model_schema.md
+          - reference/data_table_schema.md
+          - reference/math_schema.md

@@ -1,0 +1,253 @@
+# Copyright (C) since 2013 Calliope contributors listed in AUTHORS.
+# Licensed under the Apache 2.0 License (see LICENSE file).
+"""Generate LaTeX math to include in the documentation."""
+
+import importlib.resources
+import logging
+import tempfile
+import textwrap
+from pathlib import Path
+
+from mkdocs.structure.files import File
+
+import calliope
+from calliope.io import read_rich_yaml
+from calliope.postprocess import MathDocumentation
+
+logger = logging.getLogger("mkdocs")
+
+TEMPDIR = tempfile.TemporaryDirectory()
+
+MODEL_PATH = Path(__file__).parent / "dummy_model" / "model.yaml"
+
+BASE_MATH_NAV_PATH = ["Reference", "Built-in base math"]
+OTHER_MATH_NAV_PATH = ["Reference", "Other built-in math"]
+
+PREPEND_SNIPPET = """
+# {title}
+{description}
+
+## A guide to math documentation
+
+If a math component's initial conditions are met (the first `if` statement), it will be applied to a model.
+For each [objective](#objective), [constraint](#subject-to) and [global expression](#where), a number of sub-conditions then apply (the subsequent, indented `if` statements) to decide on the specific expression to apply at a given iteration of the component dimensions.
+
+In the expressions, terms in **bold** font are [decision variables](#decision-variables) and terms in *italic* font are [parameters](#parameters).
+The [decision variables](#decision-variables) and [parameters](#parameters) are listed at the end of the page; they also refer back to the global expressions / constraints in which they are used.
+Those parameters which are defined over time (`timesteps`) in the expressions can be defined by a user as a single, time invariant value, or as a timeseries that is [loaded from file or dataframe](../creating/data_tables.md).
+
+!!! note
+
+    For every math component in the documentation, we include the YAML snippet that was used to generate the math in a separate tab.
+
+[:fontawesome-solid-download: Download the {math_type} formulation as a YAML file]({filepath})
+"""
+
+
+def on_files(files: list, config: dict, **kwargs):
+    """Process documentation for pre-defined calliope math files."""
+    model_config = read_rich_yaml(MODEL_PATH)
+
+    base_documentation = generate_base_math_documentation()
+    write_file(
+        "base.yaml",
+        textwrap.dedent(
+            """
+        Complete base mathematical formulation for a Calliope model.
+        This math is _always_ applied but can be overridden with pre-defined additional math or [your own math](../user_defined_math/index.md).
+        """
+        ),
+        base_documentation,
+        files,
+        config,
+        base_math=True,
+    )
+
+    for override in model_config["overrides"].keys():
+        custom_documentation = generate_custom_math_documentation(
+            base_documentation, override
+        )
+        if "mode" in model_config.get_key(f"overrides.{override}.config.init.name"):
+            text = textwrap.dedent(
+                f"""
+            Pre-defined **mode math** to apply {custom_documentation.name} __on top of__ the [base mathematical formulation][base-math].
+            This math is _only_ applied when `config.build.mode` is set to `"{override}"`.
+            """
+            )
+        else:
+            text = textwrap.dedent(
+                f"""
+            Pre-defined **extra math** to apply {custom_documentation.name} __on top of__ the [base mathematical formulation][base-math].
+            This math is _only_ applied if referenced in the `config.init.extra_math` list as `"{override}"`.
+            """
+            )
+
+        write_file(
+            f"{override}.yaml",
+            text,
+            custom_documentation,
+            files,
+            config,
+            output_path=Path("math/built_in"),
+        )
+
+    return files
+
+
+def find_nav_reference(nav: list, nav_path: list[str]) -> dict:
+    """Find the nav entry at the end of a nested mkdocs navigation path.
+
+    Args:
+        nav (list): The mkdocs ``config["nav"]`` tree.
+        nav_path (list[str]): Sequence of nested page titles to follow, e.g.
+            ``["Reference", "Built-in base math"]``.
+
+    Returns:
+        dict: The ``{page_name: value}`` dict for the final page in the path.
+            Mutate (set or append to) its single value to attach files to the
+            navigation.
+    """
+    *parent_path, leaf = nav_path
+    reference = nav
+    for page_name in parent_path:
+        reference = next(
+            entry[page_name]
+            for entry in reference
+            if isinstance(entry, dict) and set(entry.keys()) == {page_name}
+        )
+    return next(
+        entry
+        for entry in reference
+        if isinstance(entry, dict) and set(entry.keys()) == {leaf}
+    )
+
+
+def write_file(
+    filename: str,
+    description: str,
+    math_documentation: MathDocumentation,
+    files: list[File],
+    config: dict,
+    base_math: bool = False,
+    output_path: Path = Path("math"),
+) -> None:
+    """Parse math files and produce markdown documentation.
+
+    Args:
+        filename (str): name of produced `.md` file.
+        description (str): first paragraph after title.
+        math_documentation (MathDocumentation): calliope math documentation.
+        files (list[File]): math files to parse.
+        config (dict): documentation configuration.
+        base_math (bool, optional): whether the math is the base math or an override. Defaults to False.
+        output_path (Path, optional): path to output directory for the markdown file. Defaults to Path("math").
+    """
+    output_file = (output_path / filename).with_suffix(".md")
+    output_full_filepath = Path(TEMPDIR.name) / output_file
+    output_full_filepath.parent.mkdir(exist_ok=True, parents=True)
+
+    files.append(
+        File(
+            path=output_file.as_posix(),
+            src_dir=TEMPDIR.name,
+            dest_dir=config["site_dir"],
+            use_directory_urls=config["use_directory_urls"],
+        )
+    )
+
+    # Append the source file to make it available for direct download
+    files.append(
+        File(
+            path=(Path("math") / filename).as_posix(),
+            src_dir=Path(importlib.resources.files("calliope")).as_posix(),
+            dest_dir=config["site_dir"],
+            use_directory_urls=config["use_directory_urls"],
+        )
+    )
+    nav_path = BASE_MATH_NAV_PATH if base_math else OTHER_MATH_NAV_PATH
+    second_level_page_name = nav_path[-1]
+    nav_reference = find_nav_reference(config["nav"], nav_path)
+
+    if base_math:
+        nav_reference[second_level_page_name] = output_file.as_posix()
+    else:
+        nav_reference[second_level_page_name].append(output_file.as_posix())
+
+    title = math_documentation.name
+    math_doc = math_documentation.write(format="md", mkdocs_features=True)
+    file_to_download = Path("..") / filename
+    output_full_filepath.write_text(
+        PREPEND_SNIPPET.format(
+            title=title.capitalize(),
+            description=description,
+            math_type=title.lower(),
+            filepath=file_to_download,
+        )
+        + math_doc
+    )
+
+
+def generate_base_math_documentation() -> MathDocumentation:
+    """Generate model documentation for the base math.
+
+    Returns:
+        MathDocumentation: model math documentation with latex backend.
+    """
+    model = calliope.read_yaml(file=MODEL_PATH)
+    return MathDocumentation(model)
+
+
+def generate_custom_math_documentation(
+    base_documentation: MathDocumentation, override: str
+) -> MathDocumentation:
+    """Generate model documentation for a pre-defined math file.
+
+    Only the changes made relative to the base math will be shown.
+
+    Args:
+        base_documentation (MathDocumentation): model documentation with only the base math applied.
+        override (str): Name of override to load from the list available in the model config.
+
+    Returns:
+        MathDocumentation: model math documentation with latex backend.
+    """
+    model = calliope.read_yaml(file=MODEL_PATH, scenario=override)
+
+    full_del = []
+    expr_del = []
+    for component_group, component_group_dict in model.math.build.model_dump().items():
+        if component_group in ["checks", "dimensions", "parameters", "lookups"]:
+            continue
+        for name, component_dict in component_group_dict.items():
+            if name in base_documentation.math[component_group]._active:
+                if not component_dict.get("active", True):
+                    expr_del.append((component_group, name))
+                    component_dict["description"] = "|REMOVED|"
+                    component_dict["active"] = True
+                elif base_documentation.math.find(name).model_dump() != component_dict:
+                    _add_to_description(component_dict, "|UPDATED|")
+                else:
+                    full_del.append((component_group, name))
+            else:
+                _add_to_description(component_dict, "|NEW|")
+        model.math = model.math.update(
+            {f"build.{component_group}": component_group_dict}
+        )
+    math_documentation = MathDocumentation(model)
+
+    for grp, key in expr_del:
+        math_documentation.backend.math_strings[grp][key] = ""
+    for grp, key in full_del:
+        del math_documentation.backend._dataset[key]
+    for var in math_documentation.backend._dataset.values():
+        var.attrs["references"] = var.attrs["references"].intersection(
+            math_documentation.backend._dataset.keys()
+        )
+        var.attrs["references"] = var.attrs["references"].difference(expr_del)
+
+    return math_documentation
+
+
+def _add_to_description(component_dict: dict, update_string: str) -> None:
+    """Prepend the math component description."""
+    component_dict["description"] = f"{update_string}\n{component_dict['description']}"

@@ -1,0 +1,99 @@
+
+# Model configuration (`config`)
+
+The configuration is grouped into three top-level items:
+
+* The `init` configuration items are used when you initialise your model (`calliope.Model(...)`).
+* The `build` configuration items are used when you build your optimisation problem (`calliope.Model.build(...)`).
+* The `solve` configuration items are used when you solve your optimisation problem (`calliope.Model.solve(...)`).
+
+At each of these stages you can override what you have put in your YAML file (or if not in your YAML file, [the default that Calliope uses][model-configuration-schema]).
+You do this by providing additional keyword arguments on calling `calliope.Model` or its methods. E.g.,:
+
+```python
+# Overriding `config.init` items in `calliope.Model`
+model = calliope.Model("path/to/model.yaml", subset={"timesteps": ["2005-01", "2005-02"]})
+# Overriding `config.build` items in `calliope.Model.build`
+model.build(ensure_feasibility=True)
+# Overriding `config.solve` items in `calliope.Model.solve`
+model.solve(save_logs="path/to/logs/dir")
+```
+
+None of the configuration options are _required_ as there is a default value for them all, but you will likely want to set `init.name`, `init.calliope_version`, `build.mode`, and `solve.solver`.
+
+To test your model pipeline, `config.init.subset.timesteps` is a good way to limit your model size by slicing the time dimension to a smaller range.
+
+!!! note
+    Various capabilities are available to adjust the temporal resolution of a model on-the-fly, both by resampling or using externally-provided clustering.
+    See our [time adjustment page](../advanced/time.md) for more details.
+
+!!! info "See also"
+    The full set of available configuration options is documented in the [configuration schema][model-configuration-schema].
+    This provides you with a description of each configuration option and the default which will be used if you do not provide a value.
+
+## Deep-dive into some key configuration options
+
+### `config.build.backend`
+
+By default, the optimisation problem is built using the [Pyomo](https://www.pyomo.org/) library.
+For those with a license for the Gurobi solver, we have also developed a direct interface to their Python API.
+This may reduce peak memory and time consumption compared to using the Pyomo interface with Gurobi as the solver.
+To leverage the Gurobi backend interface, you will need to:
+
+1. Install the Gurobi python library into your Calliope environment: `mamba install gurobi::gurobi`.
+1. Select the Gurobi backend in your YAML configuration (`!#yaml config.build.backend: gurobi`) or at build time if running in a Python script or interactively (`!#python model.build(backend="gurobi")`).
+
+### `config.build.ensure_feasibility`
+
+For a model to find a feasible solution, supply must always be able to meet demand.
+To avoid the solver failing to find a solution because your constraints do not enable all demand to be met, you can ensure feasibility:
+
+```yaml
+config.build.ensure_feasibility: true
+```
+
+This will create `unmet_demand` and `unused_supply` decision variables in the optimisation, which can pick up any mismatch between supply and demand, across all carriers.
+These have a very high cost associated with its use, so will only appear when absolutely necessary.
+
+!!! note
+    When ensuring feasibility, you can also define data for the [big M parameter](https://en.wikipedia.org/wiki/Big_M_method) (`data_definitions.bigM`). This is the "cost" of unmet demand.
+    It is possible to make model convergence very slow if bigM is set too high.
+    Default bigM is 1x10$^9$, but should be close to the maximum total system cost that you can imagine.
+    This is perhaps closer to 1x10$^6$ for urban scale models and can be as low as 1x10$^4$ if you have re-scaled your data in advance.
+
+### `config.build.mode`
+
+The `build.mode` option specifies pre-defined mathematical formulations that require additional processing.
+A model can run in `base`, `operate`, or `spores` mode.
+
+* In `base` mode, the default option, Calliope will not execute any additional processing beyond building the mathematical problem defined in `config.init.base_math`.
+* In `operate` mode, capacities are fixed and the system is operated with a receding horizon control algorithm.
+* In `spores` mode, the model is first run in `base` mode, then run `N` number of times to find alternative system configurations with similar monetary cost, but maximally different choice of technology capacity and location (node).
+
+In most cases, you will want to use the `base` mode.
+In fact, you can use a set of results from models run in `base` mode to initialise both the `operate` (via`config.build.operate.use_cap_results`) and `spores` (via `config.solve.spores.use_latest_results`) modes.
+
+!!! warning
+
+    Both `operate` and `spores` modes are designed to work with our pre-defined math and may stop working if it is overridden with [user-defined math](../user_defined_math/customise.md#re-defining-calliopes-pre-defined-base-math).
+
+### `config.solve.solver`
+
+Possible options for solver include `glpk`, `gurobi`, `cplex`, and `cbc`.
+The interface to these solvers is done through the Pyomo library. Any [solver compatible with Pyomo](https://pyomo.readthedocs.io/en/latest/reference/topical/appsi/appsi.solvers.html) should work with Calliope.
+
+For solvers with which Pyomo provides more than one way to interface, the additional `solver_io` option can be used.
+In the case of Gurobi, for example, it is usually fastest to use the direct Python interface:
+
+```yaml
+config:
+  solve:
+    solver: gurobi
+    solver_io: python
+```
+
+!!! note
+    While explicitly setting the non-default `solver_io: python` is faster for Gurobi, the opposite is currently true for CPLEX, which runs faster with the default `solver_io`.
+
+We tend to test using `cbc` but it is not available to install into your Calliope mamba environment on Windows.
+Therefore, we recommend you install GLPK when you are first starting out with Calliope (`mamba install glpk`).

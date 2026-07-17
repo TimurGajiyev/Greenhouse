@@ -1,0 +1,16 @@
+version: 2
+conda:
+  environment: requirements/base.txt
+build:
+  os: ubuntu-22.04
+  tools:
+    python: mambaforge-4.10
+  jobs:
+    post_create_environment:
+      - mamba install python=3.12 coin-or-cbc gurobi::gurobi --file requirements/base.txt --file requirements/dev.txt
+      - pip install --no-deps .
+      - python -m ipykernel install --user --name calliope_docs_build
+      - export PLOTLY_RENDERER="notebook"
+
+mkdocs:
+  configuration: mkdocs.yml

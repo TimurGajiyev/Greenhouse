@@ -1,0 +1,62 @@
+name: Branch Push CI
+
+on:
+  push:
+    branches:
+      - "**"
+    paths-ignore:
+      - README.md
+      - changelog.rst
+      - LICENSE
+      - CITATION
+      - AUTHORS
+      - doc/**
+      - docs/**
+      - .readthedocs.yml
+      - .pre-commit-config.yaml
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: mamba-org/setup-micromamba@v1
+      with:
+        micromamba-version: '1.5.10-0'
+        environment-name: ${{ github.event.repository.name }}-ubuntu-latest-312-${{ hashFiles('requirements/dev.txt') }}
+        environment-file: requirements/base.txt
+        create-args: >-
+          -f requirements/dev.txt
+          python=3.11
+          coin-or-cbc
+          gurobi::gurobi
+        post-cleanup: all
+        cache-environment: true
+
+    - name: Install package
+      run: pip install --no-dependencies -e .
+
+    - name: Install jupyter kernel
+      run: python -m ipykernel install --user --name calliope
+
+    - name: run tests without coverage and without time intensive tests
+      if: github.ref != 'refs/heads/main'
+      run: pytest --no-cov -m 'not time_intensive' -m 'not needs_gurobi_license'
+
+    - name: run tests with coverage
+      if: github.ref == 'refs/heads/main'
+      run: pytest --cov
+
+    - name: upload coverage report to Codecov
+      if: github.ref == 'refs/heads/main'
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: true
+        directory: "./reports/coverage/"
+        verbose: true
