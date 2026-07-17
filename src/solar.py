@@ -139,7 +139,14 @@ def build_solar_profile(
 
     # 4) Переставляем ряд на местную ось времени площадки — чтобы он
     #    совпал с профилем нагрузки час в час.
-    return _to_local_year_grid(ac_per_kwp, site.timezone)
+    series = _to_local_year_grid(ac_per_kwp, site.timezone)
+
+    # 5) Запас на слабый год (аудит №2, изъян №3): TMY — это P50,
+    #    медианный год; множитель ~0.95 приближает P90 — консервативную
+    #    оценку для критичных систем (Solargis / NREL SAM).
+    if pv is not None and pv.resource_scale_fraction is not None:
+        series = (series * pv.resource_scale_fraction).rename(series.name)
+    return series
 
 
 # ---------- приватные помощники ----------

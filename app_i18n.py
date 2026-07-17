@@ -645,8 +645,8 @@ TRANSLATIONS: dict[str, str] = {
         "Extra reserve tied to solar output: a cloud drops PV — the "
         "headroom insures against it. The panel itself provides no reserve "
         "(it is the source of uncertainty).",
-    "Точный расчёт парка (целые машины)":
-        "Exact fleet model (whole machines)",
+    "MILP Точный расчёт парка (целые машины)":
+        "MILP Exact fleet model (whole machines)",
     "Размеры кратны юниту (целые панели/шкафы/генсеты), а "
     "дизельный парк включается по часам — «сколько генсетов "
     "работает сейчас» — с минимальной загрузкой и холостым "
@@ -831,6 +831,40 @@ TRANSLATIONS: dict[str, str] = {
         "are flagged. HOMER has no public API, REopt needs an NREL key — so "
         "the cross-check uses manually entered numbers, honestly and "
         "transparently.",
+
+    # ---------- фиксы аудита №2 (v1.3) ----------
+    "Эскалация цены дизеля, %/год": "Diesel price escalation, %/yr",
+    "Насколько цена топлива растёт каждый год сверх инфляции. "
+    "Плоская цена на 20 лет занижает будущие расходы дизеля и "
+    "смещает оптимум к генсету. Учитывается одним "
+    "левелизационным коэффициентом (как в REopt).":
+        "How much the fuel price grows each year above inflation. A flat "
+        "price over 20 years understates future diesel spend and biases "
+        "the optimum toward the genset. Applied as a single levelization "
+        "factor (as in REopt).",
+    "Солнечный год для расчёта": "Solar year for the calculation",
+    "P50 — типичный год": "P50 — typical year",
+    "P90 — запас на слабый год (−5%)": "P90 — weak-year margin (−5%)",
+    "Спутниковый «типичный год» — это медиана (P50): в половине "
+    "реальных лет солнца МЕНЬШЕ. Для критичных объектов отрасль "
+    "рекомендует консервативный P90 — весь солнечный ряд "
+    "умножается на 0.95.":
+        "The satellite “typical year” is the median (P50): in half of real "
+        "years there is LESS sun. For critical sites the industry "
+        "recommends the conservative P90 — the whole solar series is "
+        "multiplied by 0.95.",
+    "Дизель может заряжать батарею (cycle charging)":
+        "Diesel can charge the battery (cycle charging)",
+    "Стратегия HOMER Cycle Charging: раз генсет уже работает, "
+    "его свободная мощность заряжает батарею — позже реже "
+    "включаться. Включай при многодневной пасмурности или "
+    "генсете меньше пика. Проверка надёжности тоже использует "
+    "эту стратегию.":
+        "The HOMER Cycle Charging strategy: since the genset is already "
+        "running, its spare power charges the battery — so it starts less "
+        "often later. Enable for multi-day cloudy spells or a genset "
+        "smaller than the peak. The reliability check uses the same "
+        "strategy.",
 
     # ---------- обёртки-помощники ----------
     "Что здесь происходит и зачем.": "What happens here and why.",

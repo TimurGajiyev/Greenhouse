@@ -84,6 +84,68 @@ def capital_recovery_factor(rate: float, years: int) -> float:
     return rate * growth / (growth - 1)
 
 
+def fuel_levelization_factor(
+    rate: float, escalation: float | None, years: int
+) -> float:
+    """Левелизационный коэффициент эскалации топлива (аудит №2, изъян №6).
+
+    Во сколько раз ПОСТОЯННАЯ (левелизованная) цена топлива выше цены
+    года 1, если реальная цена растёт на escalation в год, а деньги
+    дисконтируются по rate. Та же роль, что pwf_fuel/pwf у REopt:
+    одно число, посчитанное заранее, — и LP остаётся линейным.
+
+        LF = Σ_y ((1+e)/(1+r))^y / Σ_y (1/(1+r))^y,  y = 1..N
+
+    escalation=None или 0 -> 1.0 (плоская цена, прежнее поведение).
+    """
+    if years <= 0:
+        raise ValueError(f"LF: срок должен быть положительным, получен {years}")
+    e = escalation or 0.0
+    if e == 0.0:
+        return 1.0
+    pv_escalated = sum(((1 + e) / (1 + rate)) ** y for y in range(1, years + 1))
+    pv_flat = sum((1 / (1 + rate)) ** y for y in range(1, years + 1))
+    return pv_escalated / pv_flat
+
+
+def _resolve_sizes(scenario: Scenario, sim_result: SimulationResult) -> dict:
+    """Установленные размеры для денег (аудит №2, изъян №1).
+
+    Приоритет: решённые размеры из manifest["sizes"] (их пишет сайзер).
+    Их нет (rule-симуляция, LP-диспетчер) — берём сценарий, но ТОЛЬКО
+    если коридор заморожен (min == max): считать CAPEX по потолку
+    открытого коридора — молчаливое завышение в разы (проверено: x5.3
+    на йеменском сценарии). Открытый коридор без решённых размеров —
+    громкая ошибка, а не тихий мусор.
+    """
+    solved = sim_result.manifest.get("sizes")
+
+    def pick(key: str, lo: float, hi: float, label: str) -> float:
+        if solved is not None:
+            return float(solved[key])
+        if abs(hi - lo) > 1e-9 * max(1.0, abs(hi)):
+            raise ValueError(
+                f"Economics: у {label} открыт коридор [{lo}, {hi}], а в "
+                "manifest нет решённых размеров. Считать деньги по потолку "
+                "коридора нельзя — сначала зафиксируй размеры (min == max) "
+                "или передай результат сайзера."
+            )
+        return hi
+
+    sizes = {"pv_kw": 0.0, "batt_kwh": 0.0, "batt_kw": 0.0, "dg_kw": 0.0}
+    if scenario.pv is not None:
+        sizes["pv_kw"] = pick(
+            "pv_kwp", scenario.pv.min_kw, scenario.pv.max_kw, "PV")
+    if scenario.battery is not None:
+        b = scenario.battery
+        sizes["batt_kwh"] = pick("batt_kwh", b.min_kwh, b.max_kwh, "Battery")
+        sizes["batt_kw"] = pick("batt_kw", b.min_kw, b.max_kw, "Battery PCS")
+    if scenario.diesel is not None:
+        sizes["dg_kw"] = pick(
+            "dg_kw", scenario.diesel.min_kw, scenario.diesel.max_kw, "Diesel")
+    return sizes
+
+
 def compute_economics(
     scenario: Scenario, sim_result: SimulationResult
 ) -> EconomicsReport:
@@ -91,14 +153,18 @@ def compute_economics(
     rate = scenario.financial.discount_rate_fraction
     totals = sim_result.manifest["totals_kwh"]
 
+    # 0) Размеры: решённые из manifest, иначе замороженный сценарий
+    #    (открытый коридор без решения — ошибка, см. _resolve_sizes).
+    sizes = _resolve_sizes(scenario, sim_result)
+
     # 1) Капитал и O&M по технологиям (отсутствующая технология просто
     #    не попадает в словарь — суммы по пустому множеству дают 0).
     by_tech: dict[str, TechEconomics] = {}
 
     if scenario.pv is not None:
         by_tech["pv"] = _tech_economics(
-            capex=scenario.pv.capex_usd_per_kw * scenario.pv.max_kw,
-            om=scenario.pv.om_usd_per_kw_year * scenario.pv.max_kw,
+            capex=scenario.pv.capex_usd_per_kw * sizes["pv_kw"],
+            om=scenario.pv.om_usd_per_kw_year * sizes["pv_kw"],
             rate=rate,
             lifetime=scenario.pv.lifetime_years,
         )
@@ -106,15 +172,16 @@ def compute_economics(
         b = scenario.battery
         by_tech["battery"] = _tech_economics(
             # У батареи два ценника: ячейки ($/kWh) и PCS ($/kW).
-            capex=b.capex_usd_per_kwh * b.max_kwh + b.capex_usd_per_kw * b.max_kw,
-            om=b.om_usd_per_kwh_year * b.max_kwh,
+            capex=(b.capex_usd_per_kwh * sizes["batt_kwh"]
+                   + b.capex_usd_per_kw * sizes["batt_kw"]),
+            om=b.om_usd_per_kwh_year * sizes["batt_kwh"],
             rate=rate,
             lifetime=b.lifetime_years,
         )
     if scenario.diesel is not None:
         by_tech["diesel"] = _tech_economics(
-            capex=scenario.diesel.capex_usd_per_kw * scenario.diesel.max_kw,
-            om=scenario.diesel.om_usd_per_kw_year * scenario.diesel.max_kw,
+            capex=scenario.diesel.capex_usd_per_kw * sizes["dg_kw"],
+            om=scenario.diesel.om_usd_per_kw_year * sizes["dg_kw"],
             rate=rate,
             lifetime=scenario.diesel.lifetime_years,
         )
@@ -124,14 +191,22 @@ def compute_economics(
     om_year = sum(t.om_usd_per_year for t in by_tech.values())
 
     # 2) Топливо: kWh дизеля (энергия уже с учётом Δt — из manifest)
-    #    умножить на цену. Нет дизеля — честный ноль.
+    #    умножить на цену. Нет дизеля — честный ноль. Эскалация цены
+    #    (изъян №6): и наше топливо, и базовая линия «100% дизель»
+    #    берутся по ЛЕВЕЛИЗОВАННОЙ цене — плоская цена на 20 лет
+    #    занижала будущие OPEX дизеля и смещала оптимум к генсету.
+    lf = fuel_levelization_factor(
+        rate,
+        scenario.diesel.fuel_escalation_fraction if scenario.diesel else None,
+        scenario.financial.project_years,
+    )
     fuel_price = (
         scenario.diesel.fuel_cost_usd_per_kwh
         if scenario.diesel is not None
         else BASELINE_DIESEL_USD_PER_KWH
-    )
+    ) * lf
     fuel_year = totals["dg"] * (
-        scenario.diesel.fuel_cost_usd_per_kwh if scenario.diesel else 0.0
+        scenario.diesel.fuel_cost_usd_per_kwh * lf if scenario.diesel else 0.0
     )
 
     annual_cost = annualized_capex + om_year + fuel_year

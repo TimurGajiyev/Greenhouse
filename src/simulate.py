@@ -107,6 +107,7 @@ def run_simulation(
     results_dir: str = "results",
     write_outputs: bool = True,
     dg_outage: tuple[str, str] | None = None,
+    strategy: str = "load_following",
 ) -> SimulationResult:
     """Прогоняет сценарий через rule-based диспетчер за весь горизонт.
 
@@ -115,8 +116,17 @@ def run_simulation(
     write_outputs=False — только вернуть результат без файлов (тесты);
     dg_outage — стресс "топливный разрыв" (шаг 9): пара дат
         ("2026-07-10", "2026-07-16"), между которыми ВКЛЮЧИТЕЛЬНО
-        дизель недоступен (мощность 0) — например, кончилось топливо.
+        дизель недоступен (мощность 0) — например, кончилось топливо;
+    strategy — стратегия диспетчеризации (как в HOMER):
+        "load_following" (дефолт) — генсет выдаёт ровно дефицит;
+        "cycle_charging" — раз генсет уже работает, свободная мощность
+        заряжает батарею (аудит №2, изъян №2): позже реже включаться.
     """
+    if strategy not in ("load_following", "cycle_charging"):
+        raise ValueError(
+            f"Неизвестная стратегия {strategy!r}: жду 'load_following' "
+            "или 'cycle_charging'"
+        )
     # 1) Ряды: нагрузка задаёт сетку времени (Δt и горизонт), солнце
     #    приводится к ней. Без PV солнечный ряд — честные нули, и
     #    погода не нужна вовсе (дизель-онли работает оффлайн).
@@ -161,6 +171,7 @@ def run_simulation(
         eta=eta,
         decay=decay,
         dg_cap=dg_cap,
+        strategy=strategy,
     )
 
     # 4) Список записей -> таблица с осью времени.
@@ -280,6 +291,7 @@ def _dispatch_loop(
     eta: float,
     decay: float,
     dg_cap: pd.Series,
+    strategy: str = "load_following",
 ) -> list[TimestepRecord]:
     """Ядро симулятора: правило приоритета на каждом шаге времени.
 
@@ -331,6 +343,19 @@ def _dispatch_loop(
         # 6. Всё, что осталось, — недопоставка.
         shortfall = deficit - dg
 
+        # 5б. Cycle charging (опция, HOMER CC; аудит №2 изъян №2): раз
+        #     генсет уже работает — его свободная мощность заряжает
+        #     батарею, чтобы позже реже включаться. Заряд и разряд в один
+        #     шаг не смешиваем; charge_pv — солнечная часть заряда для
+        #     проверки русла PV ниже.
+        charge_pv = charge
+        if (strategy == "cycle_charging" and dg > 0 and discharge <= 0.0
+                and batt_kwh > 0):
+            charge_cc = max(0.0, min(dg_cap[ts] - dg, batt_kw - charge,
+                                     headroom_kw - charge))
+            dg += charge_cc
+            charge += charge_cc
+
         # SOC-динамика REopt: заряд приходит с КПД, разряд забирает с КПД.
         soc = soc + dt_hours * (eta * charge - discharge / eta)
 
@@ -340,8 +365,9 @@ def _dispatch_loop(
         assert abs(inflow - outflow) < BALANCE_TOL_KW, (
             f"{ts}: энергобаланс нарушен: приход {inflow} != расход {outflow}"
         )
-        # И выработка PV разошлась без остатка по трём руслам.
-        assert abs(pv_gen - (pv_to_load + charge + curtail)) < BALANCE_TOL_KW
+        # И выработка PV разошлась без остатка по трём руслам (солнечная
+        # часть заряда — charge_pv; дизельная добавка русло не искажает).
+        assert abs(pv_gen - (pv_to_load + charge_pv + curtail)) < BALANCE_TOL_KW
 
         records.append(
             TimestepRecord(

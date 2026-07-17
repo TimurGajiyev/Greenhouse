@@ -48,7 +48,7 @@ from dataclasses import asdict, dataclass, field
 import pandas as pd
 import pulp
 
-from src.economics import capital_recovery_factor
+from src.economics import capital_recovery_factor, fuel_levelization_factor
 from src.schema import Scenario
 from src.simulate import (
     SimulationResult,
@@ -251,9 +251,14 @@ def optimize_sizing(
         objective.append(
             (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year) * sizes["dg_kw"]
         )
+        # Цена топлива — левелизованная (изъян №6): эскалация свёрнута
+        # в один коэффициент, LP остаётся линейным (паттерн pwf_fuel REopt).
+        lf = fuel_levelization_factor(
+            rate, d.fuel_escalation_fraction, scenario.financial.project_years)
         objective.append(
             pulp.lpSum(
-                dt_hours * d.fuel_cost_usd_per_kwh * v["dg"][t] for t in range(n)
+                dt_hours * d.fuel_cost_usd_per_kwh * lf * v["dg"][t]
+                for t in range(n)
             )
         )
 
@@ -480,10 +485,14 @@ def optimize_sizing_milp(
         objective.append(
             (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year) * sizes["dg_kw"]
         )
-        # Топливо: маргинальный расход на выработку...
+        # Топливо: маргинальный расход на выработку (цена левелизована
+        # эскалацией — изъян №6)...
+        lf = fuel_levelization_factor(
+            rate, d.fuel_escalation_fraction, scenario.financial.project_years)
         objective.append(
             pulp.lpSum(
-                dt_hours * d.fuel_cost_usd_per_kwh * v["dg"][t] for t in range(n)
+                dt_hours * d.fuel_cost_usd_per_kwh * lf * v["dg"][t]
+                for t in range(n)
             )
         )
         # ...плюс ПОСТОЯННЫЙ расход холостого хода на каждый работающий юнит
@@ -493,7 +502,8 @@ def optimize_sizing_milp(
             price_l = d.fuel_price_usd_per_liter
             objective.append(
                 pulp.lpSum(
-                    dt_hours * price_l * idle_l * dg_op[t] for t in range(n)
+                    dt_hours * price_l * lf * idle_l * dg_op[t]
+                    for t in range(n)
                 )
             )
 
@@ -619,6 +629,19 @@ def _build_lp_core(
     shortfall = prob.add_variable_dicts("shortfall_kw", range(n), lowBound=0)
     soc = prob.add_variable_dicts("soc_kwh", range(n), lowBound=0)
 
+    # Заряд батареи от дизеля (cycle charging, аудит №2 изъян №2) —
+    # только по явному флагу сценария: у REopt такой поток есть всегда
+    # (Generator в techs.elec), у HOMER это стратегия Cycle Charging.
+    allow_dg_charge = (
+        scenario.diesel is not None
+        and scenario.diesel.can_charge_battery
+        and scenario.battery is not None
+    )
+    dg_to_batt = (
+        prob.add_variable_dicts("dg_to_batt_kw", range(n), lowBound=0)
+        if allow_dg_charge else None
+    )
+
     # Нецикличный старт — полная батарея (REopt off-grid:
     # soc_init_fraction=1.0); в sizing это 1.0 * batt_kwh_var — линейно.
     soc_init = sizes["batt_kwh"]
@@ -635,8 +658,19 @@ def _build_lp_core(
             pv_gen_t + discharge[t] + dg[t] + shortfall[t]
             == load_arr[t] + charge[t] + curtail[t]
         ), f"balance_{t}"
-        # Русла PV (REopt 4e): заряд и сброс питаются только солнцем.
-        prob += charge[t] + curtail[t] <= pv_gen_t, f"pv_split_{t}"
+        # Русла PV (REopt 4e): заряд и сброс питаются солнцем; при
+        # включённом cycle charging заряд может добавить и дизель.
+        if dg_to_batt is None:
+            prob += charge[t] + curtail[t] <= pv_gen_t, f"pv_split_{t}"
+        else:
+            prob += (
+                charge[t] + curtail[t] <= pv_gen_t + dg_to_batt[t]
+            ), f"pv_split_{t}"
+            # Дизельная часть заряда — часть выработки генсета...
+            prob += dg_to_batt[t] <= dg[t], f"dg_charge_part_{t}"
+            # ...и обязана реально идти в батарею (не в сброс): сброс
+            # остаётся руслом ТОЛЬКО солнца, KPI curtail не искажается.
+            prob += dg_to_batt[t] <= charge[t], f"dg_charge_used_{t}"
         # Потоки не выше размеров (REopt 4i-4n / tech_constraints).
         prob += charge[t] <= sizes["batt_kw"], f"charge_cap_{t}"
         prob += discharge[t] <= sizes["batt_kw"], f"discharge_cap_{t}"
@@ -668,7 +702,7 @@ def _build_lp_core(
         "charge": charge, "discharge": discharge, "dg": dg,
         "curtail": curtail, "shortfall": shortfall, "soc": soc,
         "eta": eta, "decay": decay, "soc_min_frac": soc_min_frac,
-        "soc_prev": soc_prev,
+        "soc_prev": soc_prev, "dg_to_batt": dg_to_batt,
     }
 
 
@@ -800,12 +834,17 @@ def _extract_result(
         pv_gen_t = sizes["pv_kwp"] * float(solar_unit.iloc[t])
         charge_t = v["charge"][t].value()
         curtail_t = v["curtail"][t].value()
+        # Дизельная часть заряда (cycle charging): PV-к-нагрузке — это
+        # выработка минус СОЛНЕЧНАЯ часть заряда, иначе pv_to_load ушёл
+        # бы в минус, когда батарею наполняет генсет.
+        dg_chg_t = (v["dg_to_batt"][t].value()
+                    if v.get("dg_to_batt") is not None else 0.0)
         rec = TimestepRecord(
             run_id=run_id,
             timestamp=ts,
             load_kw=float(load_arr[t]),
             pv_gen_kw=float(pv_gen_t),
-            pv_to_load_kw=float(pv_gen_t - charge_t - curtail_t),
+            pv_to_load_kw=float(pv_gen_t - (charge_t - dg_chg_t) - curtail_t),
             charge_kw=float(charge_t),
             discharge_kw=float(v["discharge"][t].value()),
             dg_kw=float(v["dg"][t].value()),

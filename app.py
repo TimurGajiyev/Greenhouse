@@ -31,7 +31,7 @@ from src.schema import Scenario
 from src.profiles import build_load_profile, timestep_hours
 from src.solar import build_solar_profile
 from src.simulate import run_simulation
-from src.economics import capital_recovery_factor
+from src.economics import capital_recovery_factor, fuel_levelization_factor
 from src.optimize import optimize_sizing, optimize_sizing_milp
 from src.sweep import run_sensitivity
 # app_i18n перезагружаем явно: Streamlit hot-reload обновляет только
@@ -190,7 +190,13 @@ def rule_check_cached(scenario_json: str, load_csv_text: str | None,
         data["diesel"]["min_kw"] = data["diesel"]["max_kw"] = max(
             sizes["dg_kw"], 0.001)
     scenario = Scenario.model_validate(data)
-    sim = run_simulation(scenario, weather_csv=WEATHER, write_outputs=False)
+    # Слепой контроллер играет по той же стратегии, что заявлена в
+    # сценарии: включён cycle charging — проверяем именно его.
+    strategy = ("cycle_charging"
+                if data.get("diesel", {}).get("can_charge_battery")
+                else "load_following")
+    sim = run_simulation(scenario, weather_csv=WEATHER, write_outputs=False,
+                         strategy=strategy)
     return sim.manifest["totals_kwh"], sim.manifest["lpsp"]
 
 
@@ -245,22 +251,34 @@ def econ_breakdown(data: dict, sizes: dict, metrics: dict) -> dict:
         capex_total += capex
         om_total += d["om_usd_per_kw_year"] * sizes["dg_kw"]
 
+    # Эскалация топлива (аудит №2, №6): статья «топливо» — левелизованная,
+    # как в целевой функции оптимизатора, иначе сверка сумм не сойдётся.
+    esc = data.get("diesel", {}).get("fuel_escalation_fraction") or 0.0
+    lf = fuel_levelization_factor(rate, esc, years)
+    fuel_lev = metrics["fuel_usd"] * lf
+
     items.append(("O&M", om_total, "#898781"))
-    items.append(("топливо", metrics["fuel_usd"], "#b91f1f"))
+    items.append(("топливо", fuel_lev, "#b91f1f"))
     annual = sum(v for _, v, _ in items)
 
-    baseline = metrics["load_kwh"] * data.get("diesel", {}).get(
+    baseline_year1 = metrics["load_kwh"] * data.get("diesel", {}).get(
         "fuel_cost_usd_per_kwh", 0.26)
-    savings = baseline - (om_total + metrics["fuel_usd"])
+    baseline = baseline_year1 * lf  # база эскалирует так же, как топливо
+    savings = baseline - (om_total + fuel_lev)
     return {
         "items": items,
         "annual": annual,
         "capex_total": capex_total,
         "npc": annual / capital_recovery_factor(rate, years),
         "baseline": baseline,
-        # Живые деньги года (без CRF-аннуитета) — для кривой накопленных
-        # затрат: закупка платится один раз, дальше только O&M + топливо.
-        "opex": om_total + metrics["fuel_usd"],
+        # Живые деньги года 1 (без CRF-аннуитета) — для кривой накопленных
+        # затрат: закупка платится один раз, дальше O&M + топливо, причём
+        # топливо дорожает на esc в год.
+        "om_year": om_total,
+        "fuel_year1": metrics["fuel_usd"],
+        "baseline_year1": baseline_year1,
+        "esc": esc,
+        "opex": om_total + fuel_lev,
         "savings": savings,
         "payback": capex_total / savings if savings > 0 else None,
     }
@@ -457,6 +475,12 @@ with st.sidebar.form("params"):
                "учитывается в режиме точного расчёта парка (ниже)."))
     st.caption(T("→ эффективно ${}/кВт*ч дизеля").format(
         f"{fuel_price_l * fuel_l_per_kwh:.3f}"))
+    fuel_esc_pct = st.slider(
+        T("Эскалация цены дизеля, %/год"), 0.0, 10.0, 0.0, 0.5,
+        help=T("Насколько цена топлива растёт каждый год сверх инфляции. "
+               "Плоская цена на 20 лет занижает будущие расходы дизеля и "
+               "смещает оптимум к генсету. Учитывается одним "
+               "левелизационным коэффициентом (как в REopt)."))
 
     st.subheader(T("PV-модуль и инвертор (datasheet)"))
     inv_eff = st.slider(
@@ -477,6 +501,14 @@ with st.sidebar.form("params"):
         if k == "close_mount" else T("open_rack (на раме / земле)"),
         help=T("Влияет на температуру ячейки: на раме панели охлаждаются "
                "лучше (+1–2% выработки). Кейс NIST показал значимость."))
+    solar_year = st.selectbox(
+        T("Солнечный год для расчёта"), ["p50", "p90"],
+        format_func=lambda k: T("P50 — типичный год") if k == "p50"
+        else T("P90 — запас на слабый год (−5%)"),
+        help=T("Спутниковый «типичный год» — это медиана (P50): в половине "
+               "реальных лет солнца МЕНЬШЕ. Для критичных объектов отрасль "
+               "рекомендует консервативный P90 — весь солнечный ряд "
+               "умножается на 0.95."))
 
     st.subheader(T("Батарея и площадка"))
     rte = st.slider(
@@ -531,13 +563,20 @@ with st.sidebar.form("params"):
         help=T("Дополнительный резерв, привязанный к выработке солнца: "
                "облако роняет PV — запас страхует. Панель сама резерв не "
                "даёт (она и есть источник неопределённости)."))
+    cc_on = st.checkbox(
+        T("Дизель может заряжать батарею (cycle charging)"), value=False,
+        help=T("Стратегия HOMER Cycle Charging: раз генсет уже работает, "
+               "его свободная мощность заряжает батарею — позже реже "
+               "включаться. Включай при многодневной пасмурности или "
+               "генсете меньше пика. Проверка надёжности тоже использует "
+               "эту стратегию."))
     cyclic = st.checkbox(
         T("Циклический SOC (годовое кольцо)"), value=True,
         help=T("Запас батареи в конце года «перетекает» в его начало "
                "(паттерн Calliope) — без бесплатной стартовой заправки. "
                "Выключи для сравнения с REopt-стилем (старт с полной)."))
 
-    st.subheader(T("Точный расчёт парка (целые машины)"))
+    st.subheader(T("MILP Точный расчёт парка (целые машины)"))
     milp_on = st.checkbox(
         T("Целые машины + стадирование дизеля (медленнее)"), value=False,
         help=T("Размеры кратны юниту (целые панели/шкафы/генсеты), а "
@@ -590,6 +629,12 @@ data["diesel"]["fuel_price_usd_per_liter"] = fuel_price_l
 data["diesel"]["fuel_liters_per_kwh"] = fuel_l_per_kwh
 data["diesel"]["fuel_cost_usd_per_kwh"] = eff_fuel_usd_per_kwh
 data["diesel"]["max_kw"] = max_dg
+# Аудит №2: эскалация топлива (№6), cycle charging (№2), P90-солнце (№3).
+if fuel_esc_pct:
+    data["diesel"]["fuel_escalation_fraction"] = fuel_esc_pct / 100
+data["diesel"]["can_charge_battery"] = cc_on
+if solar_year == "p90":
+    data["pv"]["resource_scale_fraction"] = 0.95
 data["site"]["roof_area_m2"] = roof
 data["reliability"] = (
     {"mode": "hard"} if rel_mode == "hard" else
@@ -992,19 +1037,32 @@ with tab_eco:
 
     # Кривая накопленных затрат — главный переговорный график: где линия
     # гибрида пересекает линию «жечь только дизель», там и окупаемость.
+    # Топливо дорожает на esc в год — эскалируют ОБЕ линии (честно).
     years_ax = list(range(0, int(data["financial"]["project_years"]) + 1))
+    cum_base, cum_hyb = [0.0], [eco["capex_total"]]
+    for y in years_ax[1:]:
+        fuel_factor = (1 + eco["esc"]) ** (y - 1)
+        cum_base.append(cum_base[-1] + eco["baseline_year1"] * fuel_factor)
+        cum_hyb.append(cum_hyb[-1] + eco["om_year"]
+                       + eco["fuel_year1"] * fuel_factor)
     fig_cf = go.Figure()
-    fig_cf.add_scatter(x=years_ax, y=[eco["baseline"] * y for y in years_ax],
+    fig_cf.add_scatter(x=years_ax, y=cum_base,
                        name=T("всё из дизеля (только топливо)"),
                        line=dict(color=C_DG, width=2, dash="dash"))
-    fig_cf.add_scatter(x=years_ax,
-                       y=[eco["capex_total"] + eco["opex"] * y
-                          for y in years_ax],
+    fig_cf.add_scatter(x=years_ax, y=cum_hyb,
                        name=T("гибрид (закупка + эксплуатация)"),
                        line=dict(color=C_BLUE, width=2))
-    if eco["payback"] and eco["payback"] <= years_ax[-1]:
-        fig_cf.add_vline(x=eco["payback"], line_dash="dot", line_color="#555",
-                         annotation_text=T("окупаемость"))
+    # Точка окупаемости — численно из самих кривых (работает и при
+    # эскалации, где простой payback уже неточен).
+    for i in range(1, len(years_ax)):
+        if cum_hyb[i] <= cum_base[i]:
+            gap0 = cum_hyb[i - 1] - cum_base[i - 1]
+            gap1 = cum_hyb[i] - cum_base[i]
+            cross = years_ax[i - 1] + (gap0 / (gap0 - gap1)
+                                       if gap0 != gap1 else 0.0)
+            fig_cf.add_vline(x=cross, line_dash="dot", line_color="#555",
+                             annotation_text=T("окупаемость"))
+            break
     fig_cf.update_layout(title=T("Накопленные затраты по годам проекта"),
                          xaxis_title=T("год проекта"), yaxis_title="$",
                          height=340, legend=dict(orientation="h", y=1.12))

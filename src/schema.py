@@ -84,6 +84,13 @@ class PVConfig(BaseModel):
     # сайзер возьмёт дефолт с пометкой ASSUMPTION (см. optimize.py).
     m2_per_kwp: float | None = Field(default=None, gt=0)
 
+    # Запас на слабый год солнца (аудит №2, изъян №3): множитель на весь
+    # удельный ряд выработки. TMY — медианный год (P50): в половине
+    # реальных лет солнца МЕНЬШЕ (кейс OKC: факт −4.2% от TMY). Отрасль
+    # (Solargis, NREL SAM) для критичных офф-грид систем рекомендует
+    # P90 ≈ 0.95. None = 1.0 (P50 как есть).
+    resource_scale_fraction: float | None = Field(default=None, gt=0.5, le=1.2)
+
     # Параметры PV-модуля и инвертора (v1.1: подняты из констант
     # solar.py в контракт по итогам верификационных кейсов OKC и NIST —
     # у вендоров эти числа в datasheet). None = дефолты solar.py.
@@ -214,6 +221,22 @@ class DieselConfig(BaseModel):
     # нагружен, — поэтому MILP гасит лишние юниты. Требует
     # fuel_price_usd_per_liter, чтобы перевести литры в деньги. None = 0.
     fuel_idle_liters_per_hour: float | None = Field(default=None, ge=0)
+
+    # Может ли генсет заряжать батарею (cycle charging; аудит №2, изъян
+    # №2). REopt разрешает всегда (Generator входит в techs.elec), HOMER
+    # делает это стратегией диспетчеризации (Cycle Charging / Combined
+    # Dispatch — NPC до −20% против чистого load following). По умолчанию
+    # выключено — включай для площадок с многодневной пасмурностью или
+    # генсетом меньше пика: батарея сможет переносить дизельную энергию
+    # во времени, а не стоять пустой.
+    can_charge_battery: bool = False
+
+    # Эскалация цены топлива, доля/год (аудит №2, изъян №6): реальные
+    # цены дизеля в удалённой логистике растут, плоская цена на 20 лет
+    # смещает оптимум к генсету. Учитывается ЛЕВЕЛИЗАЦИОННЫМ
+    # коэффициентом (economics.fuel_levelization_factor) — LP остаётся
+    # линейным. None = 0 (плоская цена, прежнее поведение).
+    fuel_escalation_fraction: float | None = Field(default=None, ge=0, lt=0.5)
 
     lifetime_years: int = Field(gt=0)
 

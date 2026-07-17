@@ -14,6 +14,10 @@ from src.simulate import SimulationResult
 
 # Δt достаём из manifest, а не "предполагаем час": инвариант 1.
 
+# Порог «генсет работает», кВт: всё, что ниже 1 Вт, — численный шум
+# солвера, а не работа машины (аудит №2, изъян №10).
+DG_ON_THRESHOLD_KW = 1e-3
+
 
 @dataclass(frozen=True)
 class KpiReport:
@@ -55,8 +59,12 @@ def compute_kpi(scenario: Scenario, sim_result: SimulationResult) -> KpiReport:
     pv_gen = totals["pv_gen"]
     curtail = totals["curtail"]
 
-    # Часы работы дизеля: число шагов с ненулевой мощностью * Δt.
-    dg_hours = float((table["dg_kw"] > 0).sum()) * dt_hours
+    # Часы работы дизеля: число шагов с мощностью выше порога * Δt.
+    # Порог 1 Вт (аудит №2, изъян №10): LP-солвер может вернуть не
+    # точный ноль, а 1e-9 кВт — без порога каждый такой шаг считался
+    # бы часом работы генсета (вход графика ТО). На HiGHS/CBC шума
+    # не наблюдалось (проверено), порог — страховка на будущее.
+    dg_hours = float((table["dg_kw"] > DG_ON_THRESHOLD_KW).sum()) * dt_hours
 
     # Деньги топлива: цена из сценария; литры — ТОЛЬКО при заданном
     # удельном расходе (fuel_liters_per_kwh), иначе честный None —
