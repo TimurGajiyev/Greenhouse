@@ -1,7 +1,8 @@
 \* greenhouse_sizing *\
 Minimize
 OBJ: 0.26 dg_kw_0 + 0.26 dg_kw_1 + 0.26 dg_kw_2 + 0.26 dg_kw_3
- + 1e-06 size_batt_kw + 14.9029498697 size_batt_kwh + 14.9029498697 size_dg_kw
+ + 1e-06 size_batt_kw + 0.00680599948388 size_batt_kwh
+ + 0.00680599948388 size_dg_kw
 Subject To
 balance_0: - charge_kw_0 - curtail_kw_0 + dg_kw_0 + discharge_kw_0
  + shortfall_kw_0 = 150

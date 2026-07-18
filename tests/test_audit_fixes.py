@@ -269,3 +269,179 @@ def test_p90_sizing_is_more_conservative():
                           weather_csv=WEATHER_CSV, write_outputs=False)
     assert (p90.sim.manifest["objective_value"]
             >= base.sim.manifest["objective_value"] - 1e-6)
+
+
+# ============ аудит №3: вес доли года (annualisation weight) ============
+
+def test_milp_objective_scales_capital_to_horizon(tmp_path):
+    """MILP, 3 часа [80,150,60], генсеты по 100 кВт, min-загрузка 0.5,
+    холостой ход 5 л/ч, ставка 0. Ручной оптимум:
+      установлено 2 юнита -> капитал+O&M за год (0.1*100+10)*200 = 4000,
+      доля горизонта 4000*3/8760 = 1.369863;
+      топливо 290 кВт*ч * 0.27 = 78.3; холостой ход 4 юнито-часа * 5 л
+      * $1 = 20; objective = 99.669863."""
+    from src.optimize import optimize_sizing_milp
+    csv = tmp_path / "aw_milp.csv"
+    csv.write_text(
+        "timestamp,load_kw\n"
+        "2026-01-01 00:00,80\n2026-01-01 01:00,150\n2026-01-01 02:00,60\n",
+        encoding="utf-8",
+    )
+    scenario = Scenario.model_validate({
+        "name": "aw-milp",
+        "site": {"name": "x", "latitude": 15.28, "longitude": 44.08,
+                 "timezone": "Asia/Aden"},
+        "diesel": {"capex_usd_per_kw": 100, "om_usd_per_kw_year": 10,
+                   "fuel_price_usd_per_liter": 1.0,
+                   "fuel_liters_per_kwh": 0.27,
+                   "fuel_idle_liters_per_hour": 5.0,
+                   "min_turn_down_fraction": 0.5,
+                   "min_kw": 0, "max_kw": 400, "unit_kw": 100,
+                   "lifetime_years": 10},
+        "load": {"profile_csv": str(csv)},
+        "financial": {"discount_rate_fraction": 0.0, "project_years": 10,
+                      "currency": "USD"},
+        "reliability": {"mode": "hard"},
+    })
+    res = optimize_sizing_milp(scenario, write_outputs=False)
+    expected = 4000 * 3 / 8760 + 290 * 0.27 + 4 * 5 * 1.0
+    assert res.sim.manifest["objective_value"] == pytest.approx(
+        expected, rel=1e-4)
+
+
+def test_year_fraction_is_one_for_full_year():
+    """Полный год: вес = 1, объектив = прежний годовой (совместимость).
+    Проверяем через сверку с экономикой: объектив сайзера на замороженном
+    решении равен CRF*CAPEX + O&M + топливо (микроштраф в допуске)."""
+    data = load_dict(SCENARIO_SIZING)
+    res = optimize_sizing(Scenario.model_validate(data),
+                          weather_csv=WEATHER_CSV, write_outputs=False)
+    eco = compute_economics(Scenario.model_validate(data), res.sim)
+    assert res.sim.manifest["objective_value"] == pytest.approx(
+        eco.annual_cost_usd, rel=1e-3)
+
+
+# ============ аудит №3: C-rate связь мощности и ёмкости ============
+
+def test_c_rate_max_couples_power_to_energy():
+    """Йемен: без связи оптимум берёт ~0.32 кВт на кВт*ч; c_rate_max=0.25
+    (батарея не быстрее 4 часов) обязан прижать мощность к 0.25*ёмкость."""
+    data = load_dict(SCENARIO_SIZING)
+    data["battery"]["c_rate_max"] = 0.25
+    res = optimize_sizing(Scenario.model_validate(data),
+                          weather_csv=WEATHER_CSV, write_outputs=False)
+    ratio = res.sizes["batt_kw"] / res.sizes["batt_kwh"]
+    assert ratio <= 0.25 + 1e-6
+    assert res.sim.manifest["totals_kwh"]["shortfall"] == pytest.approx(0)
+
+
+def test_c_rate_min_enforced():
+    """c_rate_min=0.5: мощность не ниже половины ёмкости в час."""
+    data = load_dict(SCENARIO_SIZING)
+    data["battery"]["c_rate_min"] = 0.5
+    res = optimize_sizing(Scenario.model_validate(data),
+                          weather_csv=WEATHER_CSV, write_outputs=False)
+    assert (res.sizes["batt_kw"]
+            >= 0.5 * res.sizes["batt_kwh"] - 1e-6)
+
+
+def test_c_rate_bad_pair_rejected_by_schema():
+    data = load_dict(SCENARIO_SIZING)
+    data["battery"]["c_rate_min"] = 0.5
+    data["battery"]["c_rate_max"] = 0.25
+    with pytest.raises(Exception, match="c_rate"):
+        Scenario.model_validate(data)
+
+
+# ============ аудит №3: деградация PV (левелизация выработки) ============
+
+def test_production_levelization_factor_hand():
+    """r=0, d=50%, N=2: (1 + 0.5) / 2 = 0.75; d=0 -> ровно 1."""
+    from src.economics import production_levelization_factor
+    assert production_levelization_factor(0.0, 0.5, 2) == pytest.approx(0.75)
+    assert production_levelization_factor(0.08, None, 25) == 1.0
+    assert production_levelization_factor(0.08, 0.0, 25) == 1.0
+
+
+def test_pv_degradation_scales_profile():
+    """Деградация 0.5%/год: весь ряд умножен на LF (r=8%, жизнь 25 лет),
+    LF строго меньше 1."""
+    from src.economics import production_levelization_factor
+    data = load_dict(SCENARIO_VENDOR)
+    base = build_solar_profile(Scenario.model_validate(data),
+                               weather_csv=WEATHER_CSV)
+    data["pv"]["degradation_fraction_per_year"] = 0.005
+    deg = build_solar_profile(Scenario.model_validate(data),
+                              weather_csv=WEATHER_CSV)
+    lf = production_levelization_factor(0.08, 0.005, 25)
+    assert lf < 1.0
+    assert deg.sum() == pytest.approx(lf * base.sum(), rel=1e-9)
+
+
+# ============ аудит №3: цена углерода в целевой функции ============
+
+def test_co2_price_enters_objective(tmp_path):
+    """Дизель-онли, фиксированный размер: добавка к объективу равна
+    ровно цена/т * кг/кВт*ч * кВт*ч / 1000 (потоки не меняются —
+    другого источника нет)."""
+    csv = tmp_path / "co2.csv"
+    csv.write_text(
+        "timestamp,load_kw\n"
+        "2026-01-01 00:00,100\n2026-01-01 01:00,150\n2026-01-01 02:00,120\n",
+        encoding="utf-8",
+    )
+
+    def scen(price):
+        fin = {"discount_rate_fraction": 0.0, "project_years": 10,
+               "currency": "USD"}
+        if price:
+            fin["co2_price_usd_per_ton"] = price
+        return Scenario.model_validate({
+            "name": "co2-toy",
+            "site": {"name": "x", "latitude": 15.28, "longitude": 44.08,
+                     "timezone": "Asia/Aden"},
+            "diesel": {"capex_usd_per_kw": 100, "om_usd_per_kw_year": 10,
+                       "fuel_cost_usd_per_kwh": 0.26,
+                       "co2_kg_per_kwh": 0.7,
+                       "min_kw": 150, "max_kw": 150, "lifetime_years": 10},
+            "load": {"profile_csv": str(csv)},
+            "financial": fin,
+            "reliability": {"mode": "hard"},
+        })
+
+    base = optimize_sizing(scen(None), write_outputs=False)
+    priced = optimize_sizing(scen(100.0), write_outputs=False)
+    delta = (priced.sim.manifest["objective_value"]
+             - base.sim.manifest["objective_value"])
+    # 370 кВт*ч * 0.7 кг * $100/т / 1000 = $25.9
+    assert delta == pytest.approx(25.9, rel=1e-6)
+
+
+def test_co2_price_in_economics_report(tmp_path):
+    """Экономический отчёт несёт ту же CO2-статью, что и целевая."""
+    csv = tmp_path / "co2e.csv"
+    csv.write_text(
+        "timestamp,load_kw\n"
+        "2026-01-01 00:00,100\n2026-01-01 01:00,100\n",
+        encoding="utf-8",
+    )
+    data = {
+        "name": "co2-eco",
+        "site": {"name": "x", "latitude": 15.28, "longitude": 44.08,
+                 "timezone": "Asia/Aden"},
+        "diesel": {"capex_usd_per_kw": 100, "om_usd_per_kw_year": 10,
+                   "fuel_cost_usd_per_kwh": 0.26, "co2_kg_per_kwh": 0.7,
+                   "min_kw": 100, "max_kw": 100, "lifetime_years": 10},
+        "load": {"profile_csv": str(csv)},
+        "financial": {"discount_rate_fraction": 0.0, "project_years": 10,
+                      "currency": "USD", "co2_price_usd_per_ton": 50.0},
+        "reliability": {"mode": "hard"},
+    }
+    scenario = Scenario.model_validate(data)
+    sim = run_simulation(scenario, write_outputs=False)
+    eco = compute_economics(scenario, sim)
+    # 200 кВт*ч * 0.7 кг * $50/т / 1000 = $7
+    assert eco.co2_usd_per_year == pytest.approx(7.0)
+    assert eco.annual_cost_usd == pytest.approx(
+        eco.annualized_capex_usd + eco.om_usd_per_year
+        + eco.fuel_usd_per_year + 7.0)

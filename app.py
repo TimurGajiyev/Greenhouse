@@ -33,6 +33,8 @@ from src.solar import build_solar_profile
 from src.simulate import run_simulation
 from src.economics import capital_recovery_factor, fuel_levelization_factor
 from src.optimize import optimize_sizing, optimize_sizing_milp
+from src.outage_mc import outage_survival_curve
+from src.spores import find_spores
 from src.sweep import run_sensitivity
 # app_i18n перезагружаем явно: Streamlit hot-reload обновляет только
 # главный скрипт, а импортированные модули берёт из кэша sys.modules —
@@ -197,7 +199,28 @@ def rule_check_cached(scenario_json: str, load_csv_text: str | None,
                 else "load_following")
     sim = run_simulation(scenario, weather_csv=WEATHER, write_outputs=False,
                          strategy=strategy)
-    return sim.manifest["totals_kwh"], sim.manifest["lpsp"]
+    # Кривая выживания при отказе дизеля (перенос REopt outagesim):
+    # отказ стартует каждый 3-й час года, запас — из реальной траектории.
+    surv = outage_survival_curve(scenario, sim.table,
+                                 durations_hours=(4, 8, 12, 24, 48, 72),
+                                 starts_step=3)
+    return (sim.manifest["totals_kwh"], sim.manifest["lpsp"],
+            surv.survival_by_duration, surv.quantiles)
+
+
+@st.cache_data(show_spinner="SPORES...")
+def spores_cached(scenario_json: str, load_csv_text: str | None,
+                  n_spores: int = 2, slack: float = 0.10):
+    """Почти-оптимальные альтернативы (SPORES, паттерн Calliope):
+    веер дизайнов не дороже «оптимум + slack», максимально непохожих
+    на уже найденные."""
+    data = _apply_load(json.loads(scenario_json), load_csv_text)
+    rep = find_spores(Scenario.model_validate(data), weather_csv=WEATHER,
+                      n_spores=n_spores, slack=slack)
+    designs = [rep.base] + list(rep.spores)
+    return ([{"name": d.name, "sizes": dict(d.sizes),
+              "cost": d.cost_usd_per_year} for d in designs],
+            rep.cost_cap_usd_per_year)
 
 
 @st.cache_data(show_spinner="sensitivity...")
@@ -1088,7 +1111,7 @@ with tab_rule:
         "на площадке будущего не видит. Здесь найденные размеры проверяются "
         "пошаговым симулятором без предвидения — разница и есть запас "
         "прочности плана."))
-    rule_totals, rule_lpsp = rule_check_cached(
+    rule_totals, rule_lpsp, survival, surv_q = rule_check_cached(
         scenario_json, load_csv_text, json.dumps(sizes, sort_keys=True))
 
     r1, r2, r3 = st.columns(3)
@@ -1126,9 +1149,38 @@ with tab_rule:
                 "реальной работе она больше нуля — добавь оперативный "
                 "резерв (сайдбар) или инженерный запас.")
 
+    # Кривая выживания при отказе дизеля (перенос REopt outagesim):
+    # отказ стартует в каждый 3-й час года — целое распределение вместо
+    # одного стресс-окна.
+    st.subheader(T("Если дизель пропал: кривая выживания"))
+    durs = sorted(survival)
+    fig_sv = go.Figure(go.Bar(
+        x=[str(d) for d in durs],
+        y=[survival[d] * 100 for d in durs],
+        marker_color=C_BLUE,
+        text=[f"{survival[d]:.0%}" for d in durs],
+        textposition="outside",
+    ))
+    fig_sv.update_layout(
+        title=T("Доля часов года, из которых система переживает отказ"),
+        xaxis_title=T("длительность отказа дизеля, часов"),
+        yaxis_title="%", height=320, yaxis_range=[0, 115])
+    st.plotly_chart(fig_sv, width="stretch")
+    st.caption(T("Медиана выживания на солнце и батарее: {} ч · отказ "
+                 "стартует в каждый 3-й час года, запас батареи — из "
+                 "реальной траектории").format(f"{surv_q['p50']:.0f}"))
+    legend_help("каждый столбец — вероятность пережить отказ такой "
+                "длины: отказ «запускался» из каждого 3-го часа года с "
+                "тем запасом батареи, какой был в этот момент. Ночью "
+                "запас мал — потому даже короткие отказы переживаются "
+                "не всегда. Хочешь выше столбцы — больше батарея или "
+                "оперативный резерв.")
+
     tab_footer(
         "Проверка плана на честность: найденное решение — нижняя граница "
-        "затрат. Практический смысл: к размеру дизеля стоит добавлять "
+        "затрат, а кривая выживания показывает устойчивость к отказу "
+        "дизеля не одним сценарием, а распределением по всему году. "
+        "Практический смысл: к размеру дизеля стоит добавлять "
         "инженерный запас — вендоры делают именно это."
     )
 
@@ -1298,11 +1350,54 @@ with tab_scen:
                     "(имя в легенде). Так видно, как твои изменения "
                     "передвигают и размеры закупки, и цену киловатт-часа.")
 
+    # SPORES: веер почти-оптимальных альтернатив (паттерн Calliope).
+    st.subheader(T("Альтернативные дизайны (SPORES)"))
+    st.caption(T("Почти та же цена — другое железо: поиск конфигураций "
+                 "не дороже оптимума +10%, максимально непохожих на "
+                 "найденную. Аргумент для переговоров и страховка от "
+                 "«а если батареи подорожают?»"))
+    if st.button(T("Найти альтернативы (+10% к издержкам)")) or \
+            "spores_done" in st.session_state:
+        st.session_state["spores_done"] = True
+        designs, spores_cap = spores_cached(scenario_json, load_csv_text)
+        sp_rows = []
+        for d_ in designs:
+            nm = T("оптимум") if d_["name"] == "optimum" else \
+                T("вариант {}").format(d_["name"].split("_")[-1])
+            sp_rows.append({
+                T("сценарий"): nm,
+                "PV, kWp": round(d_["sizes"]["pv_kwp"]),
+                "BESS, kWh": round(d_["sizes"]["batt_kwh"]),
+                "BESS, kW": round(d_["sizes"]["batt_kw"]),
+                "DG, kW": round(d_["sizes"]["dg_kw"]),
+                T("изд., $/год"): round(d_["cost"]),
+            })
+        st.dataframe(pd.DataFrame(sp_rows), hide_index=True,
+                     width="stretch")
+        fig_sp = go.Figure()
+        for d_, row in zip(designs, sp_rows):
+            fig_sp.add_bar(x=["PV, kWp", "BESS, kWh", "DG, kW"],
+                           y=[d_["sizes"]["pv_kwp"],
+                              d_["sizes"]["batt_kwh"],
+                              d_["sizes"]["dg_kw"]],
+                           name=row[T("сценарий")])
+        fig_sp.update_layout(
+            title=T("Оптимум и альтернативы не дороже +10%"),
+            yaxis_title="kW / kWh", height=330, barmode="group")
+        st.plotly_chart(fig_sp, width="stretch")
+        legend_help("каждая группа столбцов — один дизайн: первый — "
+                    "оптимум, остальные — варианты в пределах потолка "
+                    "издержек. Если вариант почти без батареи стоит на "
+                    "7% дороже — это цена независимости от поставок "
+                    "аккумуляторов.")
+
     tab_footer(
         "Каждый вариант — самодостаточный пакет (входы + размеры + "
         "метрики): JSON — для архива и передачи, HTML-отчёт — для письма "
         "заказчику. Таблица и графики сравнения отвечают на главный "
-        "переговорный вопрос: как меняются закупка и LCOE между вариантами."
+        "переговорный вопрос: как меняются закупка и LCOE между "
+        "вариантами; SPORES добавляет к нему веер «другого железа за "
+        "почти те же деньги»."
     )
 
 # ---------- валидация ----------

@@ -49,6 +49,7 @@ import pandas as pd
 import pulp
 
 from src.economics import capital_recovery_factor, fuel_levelization_factor
+from src.profiles import HOURS_PER_YEAR
 from src.schema import Scenario
 from src.simulate import (
     SimulationResult,
@@ -75,6 +76,11 @@ DEFAULT_M2_PER_KWP = 5.0
 # Допуск проверки баланса LP-решения (точность солвера ~1e-7
 # относительной; на сотнях kW это ~1e-4 kW).
 LP_BALANCE_TOL_KW = 1e-4
+
+# ASSUMPTION: операционные выбросы дизель-генерации ~0.72 кг CO2/kWh
+# (2.68 кг/л * ~0.27 л/кВт*ч) — дефолт для цены углерода, когда сценарий
+# не задал diesel.co2_kg_per_kwh. Та же цифра, что в KPI-слое приложения.
+DIESEL_CO2_KG_PER_KWH_DEFAULT = 0.72
 
 # Анти-вырожденный микроштраф на каждый kW/kWh размера. Зачем: если
 # у технологии нулевой ценник (у вендора PCS = $0/kW — цена внутри
@@ -169,6 +175,8 @@ def optimize_sizing(
     cyclic_soc: bool = True,
     solver: str | None = None,
     lp_snapshot_path: str | None = None,
+    cost_cap: float | None = None,
+    spore_scores: dict | None = None,
 ) -> SizingResult:
     """Шаг 8: солвер сам выбирает размеры оборудования.
 
@@ -181,12 +189,26 @@ def optimize_sizing(
     система не получает бесплатной стартовой заправки. Честнее для
     сайзинга: размер батареи оплачивает только реально прокачанную
     энергию.
+
+    Режим SPORES (аудит №3; spores.yaml Calliope): spore_scores +
+    cost_cap переключают целевую на поиск ОТЛИЧАЮЩЕЙСЯ конфигурации —
+    минимизируется Σ score_i * size_i при ограничении «годовые издержки
+    не выше cost_cap». Издержки найденного спора кладутся в manifest
+    (extra["spores"]["cost_value"]).
     """
     load, dt_hours, solar_unit = prepare_series(scenario, weather_csv)
     load_arr = load.to_numpy(dtype=float)
     solar_arr = solar_unit.to_numpy(dtype=float)
     n = len(load_arr)
     rate = scenario.financial.discount_rate_fraction
+
+    # Масштаб на долю года (аудит №3; калька annualisation_weight из
+    # Calliope base.yaml:1199). Капитал и годовой O&M — величины «за
+    # ГОД», топливо — за ГОРИЗОНТ ряда: без веса укороченный ряд платил
+    # бы полный годовой капитал против топлива за пару часов, и оптимум
+    # молча съезжал в сторону топлива. На полном годе вес = 1 —
+    # поведение прежнее.
+    year_fraction = n * dt_hours / HOURS_PER_YEAR
 
     prob = pulp.LpProblem("greenhouse_sizing", pulp.LpMinimize)
 
@@ -230,26 +252,30 @@ def optimize_sizing(
     # --- целевая функция: годовой эквивалент капитала + O&M + топливо ---
     # CRF по сроку жизни технологии — ровно те же коэффициенты, что
     # считает economics.py для готовой системы (согласованность слоёв).
+    # Капитальные слагаемые × year_fraction (см. выше).
     objective = []
     if scenario.pv is not None:
         crf_pv = capital_recovery_factor(rate, scenario.pv.lifetime_years)
         objective.append(
             (crf_pv * scenario.pv.capex_usd_per_kw
-             + scenario.pv.om_usd_per_kw_year) * sizes["pv_kwp"]
+             + scenario.pv.om_usd_per_kw_year)
+            * year_fraction * sizes["pv_kwp"]
         )
     if scenario.battery is not None:
         b = scenario.battery
         crf_b = capital_recovery_factor(rate, b.lifetime_years)
         objective.append(
             (crf_b * b.capex_usd_per_kwh + b.om_usd_per_kwh_year)
-            * sizes["batt_kwh"]
+            * year_fraction * sizes["batt_kwh"]
         )
-        objective.append(crf_b * b.capex_usd_per_kw * sizes["batt_kw"])
+        objective.append(
+            crf_b * b.capex_usd_per_kw * year_fraction * sizes["batt_kw"])
     if scenario.diesel is not None:
         d = scenario.diesel
         crf_d = capital_recovery_factor(rate, d.lifetime_years)
         objective.append(
-            (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year) * sizes["dg_kw"]
+            (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year)
+            * year_fraction * sizes["dg_kw"]
         )
         # Цена топлива — левелизованная (изъян №6): эскалация свёрнута
         # в один коэффициент, LP остаётся линейным (паттерн pwf_fuel REopt).
@@ -261,6 +287,17 @@ def optimize_sizing(
                 for t in range(n)
             )
         )
+        # Цена углерода (аудит №3): CO₂ из post-hoc поднят в целевую —
+        # аналог Lifecycle_Emissions_Cost_CO2 REopt / cost-класса Calliope.
+        if scenario.financial.co2_price_usd_per_ton:
+            kg = d.co2_kg_per_kwh or DIESEL_CO2_KG_PER_KWH_DEFAULT
+            objective.append(
+                pulp.lpSum(
+                    dt_hours * (scenario.financial.co2_price_usd_per_ton
+                                / 1000.0) * kg * v["dg"][t]
+                    for t in range(n)
+                )
+            )
 
     # --- политика надёжности ---
     mode = scenario.reliability.mode
@@ -282,14 +319,25 @@ def optimize_sizing(
         )
 
     # Микроштраф от вырожденности — на все размеры разом (см. константу).
-    objective.append(
-        pulp.lpSum(
-            SIZE_TIEBREAK_USD * s
-            for s in sizes.values()
-            if isinstance(s, pulp.LpVariable)
-        )
+    tiebreak = pulp.lpSum(
+        SIZE_TIEBREAK_USD * s
+        for s in sizes.values()
+        if isinstance(s, pulp.LpVariable)
     )
-    prob += pulp.lpSum(objective)
+    cost_expr = pulp.lpSum(objective)
+    if spore_scores is None:
+        prob += cost_expr + tiebreak
+    else:
+        # SPORES: издержки — в ограничение, целевая — скоринг «не повторяй
+        # прежние конфигурации» (spores.yaml Calliope).
+        if cost_cap is None:
+            raise ValueError("SPORES: spore_scores требует cost_cap")
+        prob += cost_expr <= cost_cap, "spores_cost_cap"
+        prob += pulp.lpSum(
+            spore_scores.get(k, 0.0) * s
+            for k, s in sizes.items()
+            if isinstance(s, pulp.LpVariable)
+        ) + tiebreak
 
     # --- площадь под панели ---
     if scenario.pv is not None and scenario.site.roof_area_m2 is not None:
@@ -297,6 +345,11 @@ def optimize_sizing(
         prob += (
             sizes["pv_kwp"] * m2_per_kwp <= scenario.site.roof_area_m2
         ), "roof_area"
+
+    # --- связь мощность/ёмкость батареи (C-rate; аудит №3) ---
+    # Аналог flow_cap_per_storage_cap_min/max Calliope: без связи солвер
+    # может выбрать абсурдную пару (огромный PCS при крошечных ячейках).
+    _add_c_rate(prob, scenario, sizes)
 
     if lp_snapshot_path is not None:
         prob.writeLP(lp_snapshot_path)
@@ -310,18 +363,26 @@ def optimize_sizing(
     }
     units = _sizes_to_units(scenario, solved_sizes)
 
+    extra = {
+        "sizes": {k: round(x, 3) for k, x in solved_sizes.items()},
+        "units": units,
+        "reliability_mode": mode,
+        "cyclic_soc": cyclic_soc,
+    }
+    if spore_scores is not None:
+        # Издержки спора (его objective_value — скоринг, не деньги).
+        extra["spores"] = {
+            "cost_value": float(pulp.value(cost_expr)),
+            "cost_cap": cost_cap,
+        }
+
     sim = _extract_result(
         scenario, load, dt_hours, solar_unit, solved_sizes, v,
         source_model=SOURCE_MODEL_SIZING,
         solver_info=solver_info,
         results_dir=results_dir,
         write_outputs=write_outputs,
-        extra={
-            "sizes": {k: round(x, 3) for k, x in solved_sizes.items()},
-            "units": units,
-            "reliability_mode": mode,
-            "cyclic_soc": cyclic_soc,
-        },
+        extra=extra,
     )
     return SizingResult(sizes=solved_sizes, units=units, sim=sim)
 
@@ -364,6 +425,11 @@ def optimize_sizing_milp(
     solar_arr = solar_unit.to_numpy(dtype=float)
     n = len(load_arr)
     rate = scenario.financial.discount_rate_fraction
+
+    # Масштаб на долю года — как в LP-сайзере (Calliope
+    # annualisation_weight): на полном годе 1, укороченный ряд платит
+    # честную долю годового капитала.
+    year_fraction = n * dt_hours / HOURS_PER_YEAR
 
     prob = pulp.LpProblem("greenhouse_sizing_milp", pulp.LpMinimize)
 
@@ -464,26 +530,30 @@ def optimize_sizing_milp(
     )
 
     # --- целевая функция ---
+    # Капитальные слагаемые × year_fraction (масштаб на долю года).
     objective = []
     if scenario.pv is not None:
         crf_pv = capital_recovery_factor(rate, scenario.pv.lifetime_years)
         objective.append(
             (crf_pv * scenario.pv.capex_usd_per_kw
-             + scenario.pv.om_usd_per_kw_year) * sizes["pv_kwp"]
+             + scenario.pv.om_usd_per_kw_year)
+            * year_fraction * sizes["pv_kwp"]
         )
     if scenario.battery is not None:
         b = scenario.battery
         crf_b = capital_recovery_factor(rate, b.lifetime_years)
         objective.append(
             (crf_b * b.capex_usd_per_kwh + b.om_usd_per_kwh_year)
-            * sizes["batt_kwh"]
+            * year_fraction * sizes["batt_kwh"]
         )
-        objective.append(crf_b * b.capex_usd_per_kw * sizes["batt_kw"])
+        objective.append(
+            crf_b * b.capex_usd_per_kw * year_fraction * sizes["batt_kw"])
     if scenario.diesel is not None:
         d = scenario.diesel
         crf_d = capital_recovery_factor(rate, d.lifetime_years)
         objective.append(
-            (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year) * sizes["dg_kw"]
+            (crf_d * d.capex_usd_per_kw + d.om_usd_per_kw_year)
+            * year_fraction * sizes["dg_kw"]
         )
         # Топливо: маргинальный расход на выработку (цена левелизована
         # эскалацией — изъян №6)...
@@ -503,6 +573,16 @@ def optimize_sizing_milp(
             objective.append(
                 pulp.lpSum(
                     dt_hours * price_l * lf * idle_l * dg_op[t]
+                    for t in range(n)
+                )
+            )
+        # Цена углерода — как в LP-сайзере (аудит №3).
+        if scenario.financial.co2_price_usd_per_ton:
+            kg = d.co2_kg_per_kwh or DIESEL_CO2_KG_PER_KWH_DEFAULT
+            objective.append(
+                pulp.lpSum(
+                    dt_hours * (scenario.financial.co2_price_usd_per_ton
+                                / 1000.0) * kg * v["dg"][t]
                     for t in range(n)
                 )
             )
@@ -541,6 +621,9 @@ def optimize_sizing_milp(
         prob += (
             sizes["pv_kwp"] * m2_per_kwp <= scenario.site.roof_area_m2
         ), "roof_area"
+
+    # C-rate коридор батареи — как в LP-сайзере.
+    _add_c_rate(prob, scenario, sizes)
 
     if lp_snapshot_path is not None:
         prob.writeLP(lp_snapshot_path)
@@ -584,7 +667,259 @@ def optimize_sizing_milp(
     return SizingResult(sizes=solved_sizes, units=units, sim=sim)
 
 
+@dataclass(frozen=True)
+class RepresentativeSizingResult:
+    """Ответ сайзера на типовых сутках: размеры + паспорт решения."""
+
+    sizes: dict
+    units: dict
+    objective_value: float
+    solver_info: dict
+    lpsp: float | None
+    n_clusters: int
+    weights: list
+
+
+def optimize_sizing_representative(
+    scenario: Scenario,
+    weather_csv: str | None = None,
+    n_days: int = 12,
+    seed: int = 0,
+    solver: str | None = None,
+) -> RepresentativeSizingResult:
+    """Сайзинг на ТИПОВЫХ СУТКАХ с двухуровневым SOC (аудит №3, шаг 6).
+
+    Год сжимается в K кластерных суток с весами (aggregate.py), а
+    сезонность батареи сохраняется формулировкой inter-cluster storage
+    из Calliope (storage_inter_cluster.yaml):
+
+      s_intra[c,h] — ВИРТУАЛЬНЫЙ запас внутри типовых суток кластера c,
+          стартует с 0 и может быть ОТРИЦАТЕЛЬНЫМ (это отклонение от
+          межсуточного уровня, не абсолютный запас);
+      smax/smin[c] — максимум/минимум s_intra за сутки кластера;
+      soc_inter[d] — абсолютный уровень на НАЧАЛО каждых реальных суток
+          d = 0..364; связь дней:
+              soc_inter[d+1] == decay24 * soc_inter[d] + s_intra[c(d), 23]
+          (кольцо: 365-е сутки перетекают в первые);
+      границы на каждый день:
+              soc_inter[d] + smax[c(d)] <= ёмкость
+              decay24 * soc_inter[d] + smin[c(d)] >= пол SOC.
+
+    Приближения v1 (документированы): ограничение 4h (no-overfill) и
+    операционный резерв в этом режиме не поддержаны — резервные поля
+    отвергаются громкой ошибкой. Размеры непрерывные (LP): цель режима —
+    скорость и дорога к масштабируемому MILP.
+    """
+    from src.aggregate import build_representative_year
+
+    rel = scenario.reliability
+    if rel.operating_reserve_load_fraction or rel.operating_reserve_pv_fraction:
+        raise ValueError(
+            "Типовые сутки v1 не поддерживают операционный резерв — "
+            "убери operating_reserve_* или используй optimize_sizing"
+        )
+
+    rep = build_representative_year(scenario, weather_csv, n_days, seed)
+    k, h_day = rep.load_kw.shape
+    dt = rep.dt_hours
+    w = rep.weights
+    rate = scenario.financial.discount_rate_fraction
+    year_fraction = float((w.sum() * h_day * dt) / HOURS_PER_YEAR)  # == 1
+
+    prob = pulp.LpProblem("greenhouse_sizing_rep", pulp.LpMinimize)
+
+    # --- размеры (как в optimize_sizing) ---
+    sizes = {"pv_kwp": 0.0, "batt_kwh": 0.0, "batt_kw": 0.0, "dg_kw": 0.0}
+    if scenario.pv is not None:
+        sizes["pv_kwp"] = prob.add_variable(
+            "size_pv_kwp", lowBound=scenario.pv.min_kw,
+            upBound=scenario.pv.max_kw)
+    if scenario.battery is not None:
+        b = scenario.battery
+        sizes["batt_kwh"] = prob.add_variable(
+            "size_batt_kwh", lowBound=b.min_kwh, upBound=b.max_kwh)
+        sizes["batt_kw"] = prob.add_variable(
+            "size_batt_kw", lowBound=b.min_kw, upBound=b.max_kw)
+    if scenario.diesel is not None:
+        sizes["dg_kw"] = prob.add_variable(
+            "size_dg_kw", lowBound=scenario.diesel.min_kw,
+            upBound=scenario.diesel.max_kw)
+
+    has_batt = scenario.battery is not None
+    if has_batt:
+        eta = math.sqrt(scenario.battery.rte_fraction)
+        soc_min_frac = scenario.battery.soc_min_fraction
+        loss = scenario.battery.self_discharge_fraction_per_hour or 0.0
+        decay = (1.0 - loss) ** dt
+    else:
+        eta, soc_min_frac, decay = 1.0, 0.0, 1.0
+    decay24 = decay ** h_day
+
+    idx = [(c, h) for c in range(k) for h in range(h_day)]
+    charge = prob.add_variable_dicts("r_charge", idx, lowBound=0)
+    discharge = prob.add_variable_dicts("r_discharge", idx, lowBound=0)
+    dg = prob.add_variable_dicts("r_dg", idx, lowBound=0)
+    curtail = prob.add_variable_dicts("r_curtail", idx, lowBound=0)
+    shortfall = prob.add_variable_dicts("r_short", idx, lowBound=0)
+
+    allow_dg_charge = (
+        scenario.diesel is not None and scenario.diesel.can_charge_battery
+        and has_batt
+    )
+    dg_to_batt = (prob.add_variable_dicts("r_dg2b", idx, lowBound=0)
+                  if allow_dg_charge else None)
+
+    # Внутрисуточный виртуальный запас (свободного знака) + max/min.
+    s_intra = prob.add_variable_dicts("r_soc_intra", idx)
+    smax = prob.add_variable_dicts("r_soc_max", range(k))
+    smin = prob.add_variable_dicts("r_soc_min", range(k))
+
+    for c in range(k):
+        # Старт суток кластера — нулевое отклонение; max/min покрывают
+        # и стартовую точку.
+        prob += smax[c] >= 0, f"r_smax0_{c}"
+        prob += smin[c] <= 0, f"r_smin0_{c}"
+        for h in range(h_day):
+            pv_gen = sizes["pv_kwp"] * float(rep.solar_unit[c, h])
+            load_kw = float(rep.load_kw[c, h])
+
+            prob += (
+                pv_gen + discharge[c, h] + dg[c, h] + shortfall[c, h]
+                == load_kw + charge[c, h] + curtail[c, h]
+            ), f"r_balance_{c}_{h}"
+            if dg_to_batt is None:
+                prob += (charge[c, h] + curtail[c, h] <= pv_gen
+                         ), f"r_split_{c}_{h}"
+            else:
+                prob += (charge[c, h] + curtail[c, h]
+                         <= pv_gen + dg_to_batt[c, h]), f"r_split_{c}_{h}"
+                prob += dg_to_batt[c, h] <= dg[c, h], f"r_dg2b_a_{c}_{h}"
+                prob += dg_to_batt[c, h] <= charge[c, h], f"r_dg2b_b_{c}_{h}"
+            prob += charge[c, h] <= sizes["batt_kw"], f"r_chcap_{c}_{h}"
+            prob += discharge[c, h] <= sizes["batt_kw"], f"r_discap_{c}_{h}"
+            prob += dg[c, h] <= sizes["dg_kw"], f"r_dgcap_{c}_{h}"
+
+            prev = s_intra[c, h - 1] if h > 0 else 0.0
+            prob += (
+                s_intra[c, h]
+                == decay * prev + dt * (eta * charge[c, h]
+                                        - discharge[c, h] / eta)
+            ), f"r_socdyn_{c}_{h}"
+            prob += smax[c] >= s_intra[c, h], f"r_smax_{c}_{h}"
+            prob += smin[c] <= s_intra[c, h], f"r_smin_{c}_{h}"
+
+    # --- межсуточный уровень: 365 реальных суток кольцом ---
+    n_real = len(rep.day_to_cluster)
+    soc_inter = prob.add_variable_dicts("r_soc_inter", range(n_real), lowBound=0)
+    for d in range(n_real):
+        c = int(rep.day_to_cluster[d])
+        nxt = (d + 1) % n_real
+        prob += (
+            soc_inter[nxt]
+            == decay24 * soc_inter[d] + s_intra[c, h_day - 1]
+        ), f"r_inter_{d}"
+        prob += (
+            soc_inter[d] + smax[c] <= sizes["batt_kwh"]
+        ), f"r_inter_max_{d}"
+        prob += (
+            decay24 * soc_inter[d] + smin[c]
+            >= soc_min_frac * sizes["batt_kwh"]
+        ), f"r_inter_min_{d}"
+
+    # --- целевая функция (веса кластеров делают топливо годовым) ---
+    objective = []
+    if scenario.pv is not None:
+        crf_pv = capital_recovery_factor(rate, scenario.pv.lifetime_years)
+        objective.append(
+            (crf_pv * scenario.pv.capex_usd_per_kw
+             + scenario.pv.om_usd_per_kw_year)
+            * year_fraction * sizes["pv_kwp"])
+    if scenario.battery is not None:
+        b = scenario.battery
+        crf_b = capital_recovery_factor(rate, b.lifetime_years)
+        objective.append(
+            (crf_b * b.capex_usd_per_kwh + b.om_usd_per_kwh_year)
+            * year_fraction * sizes["batt_kwh"])
+        objective.append(
+            crf_b * b.capex_usd_per_kw * year_fraction * sizes["batt_kw"])
+    if scenario.diesel is not None:
+        d_ = scenario.diesel
+        crf_d = capital_recovery_factor(rate, d_.lifetime_years)
+        objective.append(
+            (crf_d * d_.capex_usd_per_kw + d_.om_usd_per_kw_year)
+            * year_fraction * sizes["dg_kw"])
+        lf = fuel_levelization_factor(
+            rate, d_.fuel_escalation_fraction, scenario.financial.project_years)
+        objective.append(pulp.lpSum(
+            float(w[c]) * dt * d_.fuel_cost_usd_per_kwh * lf * dg[c, h]
+            for c, h in idx))
+        if scenario.financial.co2_price_usd_per_ton:
+            kg = d_.co2_kg_per_kwh or DIESEL_CO2_KG_PER_KWH_DEFAULT
+            objective.append(pulp.lpSum(
+                float(w[c]) * dt
+                * (scenario.financial.co2_price_usd_per_ton / 1000.0)
+                * kg * dg[c, h] for c, h in idx))
+
+    total_short = pulp.lpSum(
+        float(w[c]) * dt * shortfall[c, h] for c, h in idx)
+    total_load = float(sum(
+        w[c] * dt * rep.load_kw[c, h] for c in range(k) for h in range(h_day)))
+    mode = rel.mode
+    if mode == "hard":
+        prob += total_short == 0, "r_hard"
+    elif mode == "lpsp":
+        prob += total_short <= rel.lpsp_max_fraction * total_load, "r_lpsp"
+    else:
+        objective.append(rel.voll_usd_per_kwh * total_short)
+
+    objective.append(pulp.lpSum(
+        SIZE_TIEBREAK_USD * s for s in sizes.values()
+        if isinstance(s, pulp.LpVariable)))
+    prob += pulp.lpSum(objective)
+
+    if scenario.pv is not None and scenario.site.roof_area_m2 is not None:
+        m2 = scenario.pv.m2_per_kwp or DEFAULT_M2_PER_KWP
+        prob += sizes["pv_kwp"] * m2 <= scenario.site.roof_area_m2, "r_roof"
+    _add_c_rate(prob, scenario, sizes)
+
+    solver_info = _solve(prob, solver)
+
+    solved = {k_: (s.value() if isinstance(s, pulp.LpVariable) else s)
+              for k_, s in sizes.items()}
+    units = _sizes_to_units(scenario, solved)
+    short_val = float(pulp.value(total_short))
+    return RepresentativeSizingResult(
+        sizes=solved,
+        units=units,
+        objective_value=solver_info["objective_value"],
+        solver_info=solver_info,
+        lpsp=short_val / total_load if total_load > 0 else None,
+        n_clusters=k,
+        weights=[float(x) for x in w],
+    )
+
+
 # ---------- приватные помощники ----------
+
+
+def _add_c_rate(prob: pulp.LpProblem, scenario: Scenario, sizes: dict) -> None:
+    """C-rate коридор батареи: c_min * kWh <= kW <= c_max * kWh.
+
+    Паттерн flow_cap_per_storage_cap_min/max Calliope (base.yaml:564):
+    мощность PCS и ёмкость ячеек — физически связанные размеры; поля
+    не заданы — ограничений нет (прежнее поведение).
+    """
+    b = scenario.battery
+    if b is None:
+        return
+    if b.c_rate_max is not None:
+        prob += (
+            sizes["batt_kw"] <= b.c_rate_max * sizes["batt_kwh"]
+        ), "c_rate_max"
+    if b.c_rate_min is not None:
+        prob += (
+            sizes["batt_kw"] >= b.c_rate_min * sizes["batt_kwh"]
+        ), "c_rate_min"
 
 
 def _build_lp_core(
@@ -596,6 +931,7 @@ def _build_lp_core(
     solar_arr,
     sizes: dict,
     cyclic_soc: bool,
+    soc_init_kwh: float | None = None,
 ) -> dict:
     """Общие переменные и ограничения обоих режимов.
 
@@ -644,7 +980,9 @@ def _build_lp_core(
 
     # Нецикличный старт — полная батарея (REopt off-grid:
     # soc_init_fraction=1.0); в sizing это 1.0 * batt_kwh_var — линейно.
-    soc_init = sizes["batt_kwh"]
+    # soc_init_kwh задаёт ЯВНЫЙ старт (rolling-horizon MPC переносит
+    # запас между окнами).
+    soc_init = sizes["batt_kwh"] if soc_init_kwh is None else soc_init_kwh
 
     # "Предыдущий" запас каждого шага — понадобится слою резерва
     # (сколько ещё разряда доступно над полом soc_min).

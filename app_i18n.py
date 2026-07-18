@@ -866,6 +866,77 @@ TRANSLATIONS: dict[str, str] = {
         "smaller than the peak. The reliability check uses the same "
         "strategy.",
 
+    # ---------- большие блоки аудита №3 (v1.3) ----------
+    "Если дизель пропал: кривая выживания":
+        "If the diesel is gone: survival curve",
+    "Доля часов года, из которых система переживает отказ":
+        "Share of the year's start hours that survive the outage",
+    "длительность отказа дизеля, часов": "diesel outage duration, hours",
+    "Медиана выживания на солнце и батарее: {} ч · отказ "
+    "стартует в каждый 3-й час года, запас батареи — из "
+    "реальной траектории":
+        "Median survival on solar and battery: {} h · the outage starts "
+        "at every 3rd hour of the year, battery charge taken from the "
+        "real trajectory",
+    "каждый столбец — вероятность пережить отказ такой "
+    "длины: отказ «запускался» из каждого 3-го часа года с "
+    "тем запасом батареи, какой был в этот момент. Ночью "
+    "запас мал — потому даже короткие отказы переживаются "
+    "не всегда. Хочешь выше столбцы — больше батарея или "
+    "оперативный резерв.":
+        "each bar is the probability of surviving an outage of that "
+        "length: the outage was “launched” from every 3rd hour of the "
+        "year with whatever battery charge existed at that moment. At "
+        "night the charge is low — so even short outages are not always "
+        "survived. Want taller bars — more battery or an operating "
+        "reserve.",
+    "Проверка плана на честность: найденное решение — нижняя граница "
+    "затрат, а кривая выживания показывает устойчивость к отказу "
+    "дизеля не одним сценарием, а распределением по всему году. "
+    "Практический смысл: к размеру дизеля стоит добавлять "
+    "инженерный запас — вендоры делают именно это.":
+        "An honesty check of the plan: the found solution is the lower "
+        "bound of cost, and the survival curve shows resilience to a "
+        "diesel outage as a distribution over the whole year, not a "
+        "single scenario. Practical takeaway: add an engineering margin "
+        "to the diesel size — vendors do exactly that.",
+    "Альтернативные дизайны (SPORES)": "Alternative designs (SPORES)",
+    "Почти та же цена — другое железо: поиск конфигураций "
+    "не дороже оптимума +10%, максимально непохожих на "
+    "найденную. Аргумент для переговоров и страховка от "
+    "«а если батареи подорожают?»":
+        "Nearly the same price — different hardware: a search for "
+        "configurations no costlier than the optimum +10% and maximally "
+        "unlike the one found. A negotiation argument and insurance "
+        "against “what if batteries get expensive?”",
+    "Найти альтернативы (+10% к издержкам)":
+        "Find alternatives (+10% cost)",
+    "оптимум": "optimum",
+    "вариант {}": "variant {}",
+    "Оптимум и альтернативы не дороже +10%":
+        "The optimum and alternatives within +10%",
+    "каждая группа столбцов — один дизайн: первый — "
+    "оптимум, остальные — варианты в пределах потолка "
+    "издержек. Если вариант почти без батареи стоит на "
+    "7% дороже — это цена независимости от поставок "
+    "аккумуляторов.":
+        "each group of bars is one design: the first is the optimum, the "
+        "rest are variants within the cost ceiling. If a nearly "
+        "battery-free variant costs 7% more — that is the price of "
+        "independence from battery supply.",
+    "Каждый вариант — самодостаточный пакет (входы + размеры + "
+    "метрики): JSON — для архива и передачи, HTML-отчёт — для письма "
+    "заказчику. Таблица и графики сравнения отвечают на главный "
+    "переговорный вопрос: как меняются закупка и LCOE между "
+    "вариантами; SPORES добавляет к нему веер «другого железа за "
+    "почти те же деньги».":
+        "Each variant is a self-contained package (inputs + sizes + "
+        "metrics): the JSON — for archiving and hand-off, the HTML "
+        "report — for a letter to the client. The comparison table and "
+        "charts answer the main negotiation question: how procurement "
+        "and LCOE change between variants; SPORES adds a fan of "
+        "“different hardware for nearly the same money”.",
+
     # ---------- обёртки-помощники ----------
     "Что здесь происходит и зачем.": "What happens here and why.",
     "Как читать:": "How to read it:",

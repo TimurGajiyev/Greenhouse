@@ -45,6 +45,11 @@ from src.simulate import SimulationResult
 # При наличии блока берётся его fuel_cost_usd_per_kwh.
 BASELINE_DIESEL_USD_PER_KWH = 0.26
 
+# ASSUMPTION: выбросы дизель-генерации ~0.72 кг CO2/kWh (2.68 кг/л *
+# ~0.27 л/кВт*ч) — дефолт для цены углерода; переопределяется полем
+# diesel.co2_kg_per_kwh. Та же цифра в optimize.py и app.py.
+DIESEL_CO2_KG_PER_KWH = 0.72
+
 
 @dataclass(frozen=True)
 class TechEconomics:
@@ -65,7 +70,8 @@ class EconomicsReport:
     annualized_capex_usd: float
     om_usd_per_year: float
     fuel_usd_per_year: float
-    annual_cost_usd: float       # CRF*CAPEX + O&M + топливо
+    co2_usd_per_year: float      # цена углерода (0, если не задана)
+    annual_cost_usd: float       # CRF*CAPEX + O&M + топливо + CO2
     npc_usd: float               # Net Present Cost за горизонт проекта
     lcoe_usd_per_kwh: float | None   # None, если энергия не поставлялась
     baseline_usd_per_year: float     # "100% дизель" — годовая стоимость
@@ -106,6 +112,30 @@ def fuel_levelization_factor(
     pv_escalated = sum(((1 + e) / (1 + rate)) ** y for y in range(1, years + 1))
     pv_flat = sum((1 / (1 + rate)) ** y for y in range(1, years + 1))
     return pv_escalated / pv_flat
+
+
+def production_levelization_factor(
+    rate: float, degradation: float | None, years: int
+) -> float:
+    """Левелизационный коэффициент деградации выработки (аудит №3).
+
+    Средняя за жизнь дисконтированная выработка относительно года 1 при
+    деградации d в год (REopt utils.jl:54, levelization_factor при
+    нулевой эскалации; деградация начинается со 2-го года):
+
+        LF = Σ_y (1-d)^(y-1) / (1+r)^y  /  Σ_y 1/(1+r)^y,  y = 1..N
+
+    degradation=None или 0 -> 1.0 (техника вечно новая — прежнее
+    поведение). Множитель применяется к солнечному ряду (solar.py).
+    """
+    if years <= 0:
+        raise ValueError(f"LF: срок должен быть положительным, получен {years}")
+    d = degradation or 0.0
+    if d == 0.0:
+        return 1.0
+    num = sum((1 - d) ** (y - 1) / (1 + rate) ** y for y in range(1, years + 1))
+    den = sum(1 / (1 + rate) ** y for y in range(1, years + 1))
+    return num / den
 
 
 def _resolve_sizes(scenario: Scenario, sim_result: SimulationResult) -> dict:
@@ -209,7 +239,17 @@ def compute_economics(
         scenario.diesel.fuel_cost_usd_per_kwh * lf if scenario.diesel else 0.0
     )
 
-    annual_cost = annualized_capex + om_year + fuel_year
+    # 2б) Цена углерода (аудит №3): статья появляется, только если
+    #     сценарий задал co2_price_usd_per_ton — согласована со
+    #     слагаемым в целевой функции оптимизатора.
+    co2_year = 0.0
+    if (scenario.diesel is not None
+            and scenario.financial.co2_price_usd_per_ton):
+        kg = scenario.diesel.co2_kg_per_kwh or DIESEL_CO2_KG_PER_KWH
+        co2_year = (totals["dg"] * kg / 1000.0
+                    * scenario.financial.co2_price_usd_per_ton)
+
+    annual_cost = annualized_capex + om_year + fuel_year + co2_year
 
     # 3) NPC: годовые издержки, приведённые к сегодняшним деньгам за
     #    горизонт проекта. Деление на CRF(r, горизонт) — это умножение
@@ -235,6 +275,7 @@ def compute_economics(
         annualized_capex_usd=annualized_capex,
         om_usd_per_year=om_year,
         fuel_usd_per_year=fuel_year,
+        co2_usd_per_year=co2_year,
         annual_cost_usd=annual_cost,
         npc_usd=npc,
         lcoe_usd_per_kwh=lcoe,

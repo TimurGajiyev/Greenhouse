@@ -146,6 +146,21 @@ def build_solar_profile(
     #    оценку для критичных систем (Solargis / NREL SAM).
     if pv is not None and pv.resource_scale_fraction is not None:
         series = (series * pv.resource_scale_fraction).rename(series.name)
+
+    # 6) Деградация панелей (аудит №3): ряд усредняется по жизни
+    #    левелизационным коэффициентом (REopt: levelization_factor
+    #    умножается на каждый dvRatedProduction) — сайзер видит не
+    #    «панель года 1», а среднюю за срок службы выработку.
+    #    Импорт внутри функции: модульный импорт economics здесь создал
+    #    бы цикл (economics -> simulate -> solar).
+    if pv is not None and pv.degradation_fraction_per_year:
+        from src.economics import production_levelization_factor
+        lf = production_levelization_factor(
+            scenario.financial.discount_rate_fraction,
+            pv.degradation_fraction_per_year,
+            pv.lifetime_years,
+        )
+        series = (series * lf).rename(series.name)
     return series
 
 

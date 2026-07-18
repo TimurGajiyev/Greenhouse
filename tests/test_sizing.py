@@ -25,10 +25,12 @@ def toy_diesel_sizing_scenario(tmp_path) -> Scenario:
     """Игрушка: дизель-онли сайзинг, ставка 0, простые числа.
 
     Нагрузка: 3 часа [100, 150, 120] kW. Режим hard -> дизель обязан
-    покрыть пик: dg_kw == 150. Ручной оптимум:
-      капитал CRF(0,10)*100$/kW*150 = 0.1*100*150 = 1500/год
-      O&M 10*150 = 1500/год; топливо 0.26*370 = 96.2
-      objective = 3096.2 (+микроштраф ~0.00015 — в допуске approx).
+    покрыть пик: dg_kw == 150. Ручной оптимум (капитал и O&M взвешены
+    долей года 3/8760 — annualisation weight, аудит №3):
+      капитал+O&M за год: (0.1*100 + 10)*150 = 3000
+      доля горизонта: 3000 * 3/8760 = 1.027397
+      топливо: 0.26 * 370 = 96.2
+      objective = 97.227397 (+микроштраф ~0.00015 — в допуске approx).
     """
     csv = tmp_path / "toy3.csv"
     csv.write_text(
@@ -58,7 +60,8 @@ def test_toy_diesel_sizing_hand_optimum(tmp_path):
 
     # Размер == пик нагрузки: меньше нельзя (hard), больше — дороже.
     assert res.sizes["dg_kw"] == pytest.approx(150, abs=1e-4)
-    assert res.sim.manifest["objective_value"] == pytest.approx(3096.2, rel=1e-4)
+    assert res.sim.manifest["objective_value"] == pytest.approx(
+        96.2 + 3000 * 3 / 8760, rel=1e-4)
     assert res.sim.manifest["totals_kwh"]["shortfall"] == pytest.approx(0)
 
 

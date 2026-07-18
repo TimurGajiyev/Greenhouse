@@ -91,6 +91,13 @@ class PVConfig(BaseModel):
     # P90 ≈ 0.95. None = 1.0 (P50 как есть).
     resource_scale_fraction: float | None = Field(default=None, gt=0.5, le=1.2)
 
+    # Деградация панелей, доля/год (аудит №3): выработка усредняется по
+    # жизни левелизационным коэффициентом (REopt utils.jl:54,
+    # levelization_factor; их дефолт 0.5%/год) — панель года №20 не
+    # считается новой. None = 0 (без деградации, прежнее поведение).
+    degradation_fraction_per_year: float | None = Field(
+        default=None, ge=0, lt=0.1)
+
     # Параметры PV-модуля и инвертора (v1.1: подняты из констант
     # solar.py в контракт по итогам верификационных кейсов OKC и NIST —
     # у вендоров эти числа в datasheet). None = дефолты solar.py.
@@ -161,6 +168,13 @@ class BatteryConfig(BaseModel):
     unit_kwh: float | None = Field(default=None, gt=0)
     unit_kw: float | None = Field(default=None, gt=0)
 
+    # C-rate коридор (аудит №3; Calliope flow_cap_per_storage_cap_min/max):
+    # связь мощности и ёмкости, 1/ч. c_rate_max=0.5 значит «PCS не больше
+    # половины ёмкости в час» (2-часовая батарея и медленнее). Без полей
+    # kW и kWh независимы — солвер может выбрать абсурдную пару.
+    c_rate_min: float | None = Field(default=None, gt=0)
+    c_rate_max: float | None = Field(default=None, gt=0)
+
     lifetime_years: int = Field(gt=0)
 
     @model_validator(mode="after")
@@ -169,6 +183,9 @@ class BatteryConfig(BaseModel):
             raise ValueError("Battery: max_kwh не может быть меньше min_kwh")
         if self.max_kw < self.min_kw:
             raise ValueError("Battery: max_kw не может быть меньше min_kw")
+        if (self.c_rate_min is not None and self.c_rate_max is not None
+                and self.c_rate_max < self.c_rate_min):
+            raise ValueError("Battery: c_rate_max не может быть меньше c_rate_min")
         return self
 
 
@@ -237,6 +254,11 @@ class DieselConfig(BaseModel):
     # коэффициентом (economics.fuel_levelization_factor) — LP остаётся
     # линейным. None = 0 (плоская цена, прежнее поведение).
     fuel_escalation_fraction: float | None = Field(default=None, ge=0, lt=0.5)
+
+    # Операционные выбросы, кг CO2 на кВт*ч дизельной энергии (для цены
+    # углерода в целевой функции; аудит №3). None = дефолт 0.72
+    # (2.68 кг/л * ~0.27 л/кВт*ч).
+    co2_kg_per_kwh: float | None = Field(default=None, gt=0)
 
     lifetime_years: int = Field(gt=0)
 
@@ -330,6 +352,12 @@ class FinancialConfig(BaseModel):
     discount_rate_fraction: float = Field(ge=0, lt=1)
     project_years: int = Field(gt=0)
     currency: str
+
+    # Цена углерода, $/тонну CO2 (аудит №3): поднимает выбросы из
+    # post-hoc KPI в ЦЕЛЕВУЮ функцию — аналог Lifecycle_Emissions_Cost
+    # REopt и cost-класса co2 Calliope. None = выбросы не оптимизируются
+    # (только справочный KPI, прежнее поведение).
+    co2_price_usd_per_ton: float | None = Field(default=None, ge=0)
 
 
 class ReliabilityConfig(BaseModel):
