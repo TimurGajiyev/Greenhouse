@@ -147,7 +147,18 @@ def run_sizing_cached(scenario_json: str, load_csv_text: str | None,
         "bess": monthly_df["discharge_kw"].tolist(),
         "dg": monthly_df["dg_kw"].tolist(),
     } if len(monthly_df) >= 2 else None
-    return res.sizes, res.units, metrics, energy_mix, week, monthly
+    # Типовые сутки (плейбук аудита №4, график №3): средний по всем дням
+    # года профиль каждого часа — «как система работает по часам» одним
+    # взглядом, без каши из 8760 точек.
+    hourly = tbl.groupby(tbl.index.hour)[
+        ["pv_to_load_kw", "discharge_kw", "dg_kw", "load_kw"]].mean()
+    typical = {
+        "pv": hourly["pv_to_load_kw"].tolist(),
+        "bess": hourly["discharge_kw"].tolist(),
+        "dg": hourly["dg_kw"].tolist(),
+        "load": hourly["load_kw"].tolist(),
+    } if len(hourly) == 24 else None
+    return res.sizes, res.units, metrics, energy_mix, week, monthly, typical
 
 
 @st.cache_data(show_spinner="profiles...")
@@ -681,8 +692,8 @@ scenario_json = json.dumps(data, sort_keys=True)
 # ============================ запуск ядра ============================
 
 try:
-    sizes, units, metrics, energy_mix, week, monthly = run_sizing_cached(
-        scenario_json, load_csv_text, cyclic, milp_on)
+    sizes, units, metrics, energy_mix, week, monthly, typical = \
+        run_sizing_cached(scenario_json, load_csv_text, cyclic, milp_on)
 except RuntimeError as e:
     st.error(T("Оптимизация не удалась: {}").format(e))
     st.stop()
@@ -786,7 +797,7 @@ with tab_cfg:
                     name=T("база (зафиксирована кнопкой)"),
                     orientation="h", marker_color=C_BLUE_LIGHT)
     fig_cap.update_layout(title=T("Размеры: текущее решение против базы"),
-                          height=300,
+                          height=300, yaxis=dict(automargin=True),
                           margin=dict(l=10, r=10, t=40, b=10), barmode="group")
     left.plotly_chart(fig_cap, width="stretch")
     with left:
@@ -894,6 +905,30 @@ with tab_cfg:
 # ---------- диспетчеризация ----------
 
 with tab_disp:
+    # Плейбук №3: типовые сутки — «как система работает по часам»
+    # за 10 секунд (стек за средний день вместо каши из 8760 точек).
+    if typical is not None:
+        x24 = list(range(24))
+        fig_td = go.Figure()
+        for key, name_ru, color in (
+                ("pv", "солнце → завод (напрямую)", C_PV),
+                ("bess", "батарея → завод (разряд запаса)", C_BESS),
+                ("dg", "дизель → завод (резерв)", C_DG)):
+            fig_td.add_scatter(x=x24, y=typical[key], name=T(name_ru),
+                               stackgroup="day", mode="none", fillcolor=color)
+        fig_td.add_scatter(x=x24, y=typical["load"],
+                           name=T("нагрузка завода (спрос)"),
+                           line=dict(color="#111", dash="dash", width=1.5))
+        fig_td.update_layout(
+            title=T("Типовые сутки: кто кормит завод в среднем за год"),
+            xaxis_title=T("час суток"), yaxis_title="kW", height=360,
+            legend=dict(orientation="h", y=1.14))
+        st.plotly_chart(fig_td, width="stretch")
+        legend_help("усреднённые по всем дням года сутки: жёлтое солнце "
+                    "днём, зелёная батарея вечером, красный дизель ночью — "
+                    "читается без пояснений. Пунктир — средний спрос; "
+                    "детали конкретной недели — на графиках ниже.")
+
     if week is None:
         st.info(T("Недельный график доступен для годового часового профиля."))
     else:
@@ -1037,6 +1072,35 @@ with tab_eco:
               T("{} лет").format(f"{eco['payback']:.1f}") if eco["payback"]
               else T("нет"))
 
+    # Плейбук №4: цена киловатт-часа — проект против «только дизель».
+    # Две колонки: заказчик видит, во что превращаются $/кВт*ч дизеля
+    # и из чего сложена цена проекта (капитал / O&M / топливо).
+    served_kwh = max(metrics["served_kwh"], 1e-9)
+    base_lcoe = eco["baseline"] / max(metrics["load_kwh"], 1e-9)
+    fig_l2 = go.Figure()
+    fig_l2.add_bar(x=[T("только дизель")], y=[base_lcoe],
+                   marker_color=C_DG, name=T("топливо дизеля"))
+    for name_ru, value, color in eco["items"]:
+        fig_l2.add_bar(x=[T("проект PV+BESS+DG")], y=[value / served_kwh],
+                       marker_color=color, name=T(name_ru))
+    fig_l2.add_annotation(x=T("только дизель"), y=base_lcoe,
+                          text=f"${base_lcoe:.3f}", showarrow=False,
+                          yshift=14)
+    if metrics["lcoe_usd_per_kwh"]:
+        fig_l2.add_annotation(x=T("проект PV+BESS+DG"),
+                              y=metrics["lcoe_usd_per_kwh"],
+                              text=f"${metrics['lcoe_usd_per_kwh']:.3f}",
+                              showarrow=False, yshift=14)
+    fig_l2.update_layout(
+        title=T("Цена киловатт-часа: проект против «только дизель»"),
+        barmode="stack", yaxis_title="$/kWh", height=340,
+        legend=dict(orientation="h", y=-0.15))
+    st.plotly_chart(fig_l2, width="stretch")
+    legend_help("левая колонка — сколько стоит киловатт-час, если жечь "
+                "только дизель; правая — цена проекта, разложенная на "
+                "слагаемые (цвета — как во всех графиках). Разница колонок "
+                "— экономия на каждом киловатт-часе.")
+
     fig_e = go.Figure()
     for name_ru, value, color in eco["items"]:
         fig_e.add_bar(y=[T(name_ru)], x=[value], orientation="h",
@@ -1047,6 +1111,7 @@ with tab_eco:
             f"{eco['annual']:,.0f}"),
         xaxis_title="$/yr", height=330,
         xaxis_range=[0, max(v for _, v, _ in eco["items"]) * 1.25],
+        yaxis=dict(automargin=True),  # полные подписи («капитал BESS»)
     )
     st.plotly_chart(fig_e, width="stretch")
     legend_help("цвет полосы = технология (жёлтый PV, зелёный BESS, красный "
@@ -1095,6 +1160,51 @@ with tab_eco:
                 "растёт медленнее (солнце бесплатное). Точка пересечения — "
                 "окупаемость: дальше каждый год работает в плюс.")
 
+    # Плейбук №6: водопад окупаемости — CAPEX вниз, годовая экономия
+    # вверх, пересечение нуля = год окупаемости. Язык финансиста.
+    yrs_n = int(data["financial"]["project_years"])
+    save_by_year = [
+        (eco["baseline_year1"] - eco["fuel_year1"])
+        * (1 + eco["esc"]) ** (y - 1) - eco["om_year"]
+        for y in range(1, yrs_n + 1)
+    ]
+    # Водопад строим РУКАМИ из go.Bar с базами: go.Waterfall под темой
+    # Streamlit ломается (их plotly-шаблон теряет первый убывающий
+    # столбец и красит бары цветами-заглушками #00003x) — найдено на
+    # скриншот-тестах, воспроизводится и в браузере.
+    wf_x = [T("CAPEX")] + [str(y) for y in range(1, yrs_n + 1)]
+    wf_steps = [-eco["capex_total"]] + save_by_year
+    wf_base, wf_h, wf_cum = [], [], [0.0]
+    cum = 0.0
+    for s_ in wf_steps:
+        wf_base.append(cum + min(s_, 0.0))   # низ бара
+        wf_h.append(abs(s_))                 # высота бара
+        cum += s_
+        wf_cum.append(cum)
+    fig_wf = go.Figure(go.Bar(
+        x=wf_x, y=wf_h, base=wf_base,
+        marker_color=[C_DG] + [C_BESS] * yrs_n,
+    ))
+    fig_wf.add_hline(y=0, line_color="#555", line_width=1)
+    for i in range(1, len(wf_steps)):
+        if wf_cum[i + 1] >= 0:
+            fig_wf.add_annotation(x=wf_x[i], y=wf_cum[i + 1],
+                                  text=T("окупился: год {}").format(i),
+                                  showarrow=False, yshift=18)
+            break
+    fig_wf.update_layout(
+        title=T("Водопад окупаемости: вложение и возврат по годам"),
+        # Ось — явно категориальная: шаблон Streamlit не ставит
+        # autotypenumbers='strict', и plotly.js превращает "1".."10" в
+        # числа, выбрасывая категорию "CAPEX" вместе со столбцом.
+        xaxis=dict(title=T("год проекта"), type="category"),
+        yaxis_title="$", height=340, showlegend=False)
+    st.plotly_chart(fig_wf, width="stretch")
+    legend_help("красный столбец — разовое вложение; зелёные — экономия "
+                "каждого года против «только дизель» (с учётом дорожающего "
+                "топлива). Где лесенка пересекает ноль — там деньги "
+                "вернулись; дальше проект работает в плюс.")
+
     tab_footer(
         "Деньги системы в одном месте: CRF превращает разовые покупки в "
         "годовые платежи, NPC собирает все затраты горизонта в сегодняшних "
@@ -1141,7 +1251,8 @@ with tab_rule:
                   orientation="h", marker_color=C_BLUE_LIGHT)
     fig_r.update_layout(
         title=T("Годовые потоки: идеальный план против реальной работы"),
-        xaxis_title=T("kWh за год"), height=340, barmode="group")
+        xaxis_title=T("kWh за год"), height=340, barmode="group",
+        yaxis=dict(automargin=True))
     st.plotly_chart(fig_r, width="stretch")
     legend_help("пары полос сравнивают одинаковые потоки НА ОДНИХ размерах "
                 "железа. Тёмная — недостижимый идеал; светлая — "
@@ -1163,7 +1274,10 @@ with tab_rule:
     ))
     fig_sv.update_layout(
         title=T("Доля часов года, из которых система переживает отказ"),
-        xaxis_title=T("длительность отказа дизеля, часов"),
+        # Категориальная ось: без strict-типизации plotly.js превратил бы
+        # строки "4".."72" в числа — тонкие столбики с дырами.
+        xaxis=dict(title=T("длительность отказа дизеля, часов"),
+                   type="category"),
         yaxis_title="%", height=320, yaxis_range=[0, 115])
     st.plotly_chart(fig_sv, width="stretch")
     st.caption(T("Медиана выживания на солнце и батарее: {} ч · отказ "

@@ -937,6 +937,44 @@ TRANSLATIONS: dict[str, str] = {
         "and LCOE change between variants; SPORES adds a fan of "
         "“different hardware for nearly the same money”.",
 
+    # ---------- плейбук клиентских графиков (аудит №4) ----------
+    "Типовые сутки: кто кормит завод в среднем за год":
+        "Typical day: who feeds the plant on average over the year",
+    "час суток": "hour of day",
+    "усреднённые по всем дням года сутки: жёлтое солнце "
+    "днём, зелёная батарея вечером, красный дизель ночью — "
+    "читается без пояснений. Пунктир — средний спрос; "
+    "детали конкретной недели — на графиках ниже.":
+        "a day averaged over all days of the year: yellow solar by day, "
+        "green battery in the evening, red diesel at night — reads without "
+        "explanations. The dashed line is average demand; the details of a "
+        "specific week are in the charts below.",
+    "Цена киловатт-часа: проект против «только дизель»":
+        "Price per kilowatt-hour: the project vs “diesel only”",
+    "только дизель": "diesel only",
+    "проект PV+BESS+DG": "PV+BESS+DG project",
+    "топливо дизеля": "diesel fuel",
+    "левая колонка — сколько стоит киловатт-час, если жечь "
+    "только дизель; правая — цена проекта, разложенная на "
+    "слагаемые (цвета — как во всех графиках). Разница колонок "
+    "— экономия на каждом киловатт-часе.":
+        "the left column is the cost of a kilowatt-hour when burning "
+        "diesel only; the right one is the project’s price broken into "
+        "components (colors as on all charts). The difference between the "
+        "columns is the saving on every kilowatt-hour.",
+    "Водопад окупаемости: вложение и возврат по годам":
+        "Payback waterfall: investment and returns by year",
+    "CAPEX": "CAPEX",
+    "окупился: год {}": "breaks even: year {}",
+    "красный столбец — разовое вложение; зелёные — экономия "
+    "каждого года против «только дизель» (с учётом дорожающего "
+    "топлива). Где лесенка пересекает ноль — там деньги "
+    "вернулись; дальше проект работает в плюс.":
+        "the red bar is the one-off investment; the green ones are each "
+        "year’s savings vs “diesel only” (fuel escalation included). Where "
+        "the staircase crosses zero the money has returned; beyond that "
+        "the project works in your favor.",
+
     # ---------- обёртки-помощники ----------
     "Что здесь происходит и зачем.": "What happens here and why.",
     "Как читать:": "How to read it:",
