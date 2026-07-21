@@ -1090,10 +1090,50 @@ COLUMNS_HELP_EN = """
 """
 
 
+# ---------- реестр языков ----------
+# Русский — язык-источник (ключи), остальные — словари переводов.
+# Добавить язык: положить словарь RU->XX рядом и вписать сюда одну
+# строку; app.py подхватит его автоматически (список берётся отсюда).
+from app_i18n_cs import COLUMNS_HELP_CS, GLOSSARY_CS, TRANSLATIONS_CS
+
+LANGUAGES: tuple[str, ...] = ("RU", "EN", "CS")
+
+_CATALOGS: dict[str, dict[str, str]] = {
+    "EN": TRANSLATIONS,
+    "CS": TRANSLATIONS_CS,
+}
+
+_GLOSSARIES: dict[str, str] = {
+    "RU": GLOSSARY_RU,
+    "EN": GLOSSARY_EN,
+    "CS": GLOSSARY_CS,
+}
+
+_COLUMNS_HELP: dict[str, str] = {
+    "RU": COLUMNS_HELP_RU,
+    "EN": COLUMNS_HELP_EN,
+    "CS": COLUMNS_HELP_CS,
+}
+
+
 def make_t(lang: str):
-    """Возвращает функцию перевода t() для выбранного языка."""
+    """Возвращает функцию перевода t() для выбранного языка.
+
+    Неизвестный язык или отсутствующий ключ — русский as-is: интерфейс
+    не падает, просто показывает язык-источник (graceful fallback).
+    """
+    catalog = _CATALOGS.get(lang)
+
     def t(s: str) -> str:
-        if lang == "EN":
-            return TRANSLATIONS.get(s, s)
-        return s
+        return catalog.get(s, s) if catalog is not None else s
     return t
+
+
+def get_glossary(lang: str) -> str:
+    """Словарь терминов на выбранном языке (нет — русский)."""
+    return _GLOSSARIES.get(lang, GLOSSARY_RU)
+
+
+def get_columns_help(lang: str) -> str:
+    """Пояснения к колонкам спецификации (нет — русские)."""
+    return _COLUMNS_HELP.get(lang, COLUMNS_HELP_RU)

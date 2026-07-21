@@ -15,6 +15,13 @@ import re
 import sys
 from pathlib import Path
 
+# Консоль Windows часто cp1251 — принудительно пишем UTF-8, иначе имена
+# файлов с чешскими диакритиками (č, ř, ě) роняют print.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import plotly.graph_objects as go
 from streamlit.testing.v1 import AppTest
 
@@ -35,8 +42,8 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     at = AppTest.from_file("app.py", default_timeout=300)
-    if lang == "EN":
-        at.session_state["lang"] = "EN"
+    if lang != "RU":
+        at.session_state["lang"] = lang
     at.run()
     assert not at.exception, at.exception
 
