@@ -35,7 +35,7 @@
     "lifetime_years": 15
   },
   "load": {
-    "profile_csv": "scenarios\\pacific_island_load.csv"
+    "profile_csv": "scenarios/pacific_island_load.csv"
   },
   "financial": {
     "discount_rate_fraction": 0.08,
